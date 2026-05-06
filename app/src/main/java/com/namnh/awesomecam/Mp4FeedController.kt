@@ -100,7 +100,7 @@ class Mp4FeedController(
             add("SOURCE=${shellQuote(source)}")
         }
         add("if [ ! -r \"${'$'}SOURCE\" ]; then echo \"ERROR: selected prescaled video missing/unreadable: ${'$'}SOURCE\"; exit 1; fi")
-        add("${shellQuote(PLAYER_PATH)} --input \"${'$'}SOURCE\" --auto-variant --loop --pidfile ${shellQuote(PLAYER_PID)} >> ${shellQuote(PLAYER_LOG)} 2>&1 &")
+        add("${shellQuote(PLAYER_PATH)} --input \"${'$'}SOURCE\" --auto-variant --loop --fps-cap 30 --pidfile ${shellQuote(PLAYER_PID)} >> ${shellQuote(PLAYER_LOG)} 2>&1 &")
         add("sleep 0.5")
         add(
             """

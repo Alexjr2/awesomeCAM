@@ -8,6 +8,7 @@
 #include <media/NdkMediaExtractor.h>
 #include <media/NdkMediaFormat.h>
 #include <signal.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
@@ -47,6 +48,8 @@ struct Options {
   std::string pidfile = "/data/camera/awesomecam_player.pid";
   bool loop = true;
   bool auto_variant = true;
+  int fps_cap = 30;
+  bool fps_cap_cli = false;
 };
 
 struct BinderClient {
@@ -176,7 +179,28 @@ bool StartsWith(const std::string &value, const char *prefix) {
 }
 
 void PrintUsage() {
-  LOGI("MediaCodecPlayer usage: awesomecam_player --input /data/camera/input_1440x1080.mp4 --loop --pidfile /data/camera/awesomecam_player.pid");
+  LOGI("MediaCodecPlayer usage: awesomecam_player --input /data/camera/input_1440x1080.mp4 --loop --fps-cap 30 --pidfile /data/camera/awesomecam_player.pid");
+}
+
+int ClampFpsCap(int value) {
+  if (value <= 0) return 0;
+  if (value < 5) return 5;
+  if (value > 120) return 120;
+  return value;
+}
+
+int ReadFpsCapFile(int fallback) {
+  int fd = open("/data/camera/awesomecam_fps_cap", O_RDONLY | O_CLOEXEC);
+  if (fd < 0) return fallback;
+  char buf[32];
+  const ssize_t n = read(fd, buf, sizeof(buf) - 1);
+  close(fd);
+  if (n <= 0) return fallback;
+  buf[n] = '\0';
+  char *end = nullptr;
+  const long parsed = strtol(buf, &end, 10);
+  if (end == buf) return fallback;
+  return ClampFpsCap(static_cast<int>(parsed));
 }
 
 Options ParseOptions(int argc, char **argv) {
@@ -202,6 +226,11 @@ Options ParseOptions(int argc, char **argv) {
       opt.auto_variant = true;
     } else if (arg == "--fixed-input") {
       opt.auto_variant = false;
+    } else if (arg == "--fps-cap") {
+      if (const char *v = need_value("--fps-cap")) {
+        opt.fps_cap = ClampFpsCap(atoi(v));
+        opt.fps_cap_cli = true;
+      }
     } else if (arg == "--max-long" || arg == "--max-short" || arg == "--service") {
       // Kept for CLI compatibility with the older FFmpeg player.  Playback now
       // expects already-prescaled input and does not resize while decoding.
@@ -210,6 +239,7 @@ Options ParseOptions(int argc, char **argv) {
       PrintUsage();
     }
   }
+  if (!opt.fps_cap_cli) opt.fps_cap = ReadFpsCapFile(opt.fps_cap);
   return opt;
 }
 
@@ -603,6 +633,24 @@ void PaceFrame(int64_t pts_us, bool *clock_started, int64_t *base_wall_us,
   if (sleep_us > 1000 && !g_stop.load(std::memory_order_acquire)) {
     std::this_thread::sleep_for(std::chrono::microseconds(sleep_us));
   }
+}
+
+bool ShouldDropForFpsCap(const Options &opt, int64_t pts_us, bool clock_started,
+                         int64_t base_wall_us, int64_t base_pts_us,
+                         int64_t last_published_pts_us) {
+  if (opt.fps_cap <= 0 || pts_us < 0) return false;
+  const int64_t min_delta_us = std::max<int64_t>(1, 1000000LL / opt.fps_cap);
+  if (last_published_pts_us >= 0 &&
+      pts_us - last_published_pts_us < (min_delta_us * 9) / 10) {
+    return true;
+  }
+  if (clock_started) {
+    const int64_t target_wall_us =
+        base_wall_us + std::max<int64_t>(0, pts_us - base_pts_us);
+    const int64_t late_us = MonotonicUs() - target_wall_us;
+    if (late_us > min_delta_us * 2) return true;
+  }
+  return false;
 }
 
 bool PreferMediaCodecNv21() {
@@ -1031,10 +1079,10 @@ DecodeOutcome DecodeOnce(const Options &opt, BinderClient *binder,
       return false;
     }
     if (!stream_logged) {
-      LOGI("MediaCodecPlayer: stream=%zu mime=%s src=%dx%d out=%dx%d fps=%d durationUs=%lld input=%s",
+      LOGI("MediaCodecPlayer: stream=%zu mime=%s src=%dx%d out=%dx%d fps=%d fpsCap=%d durationUs=%lld input=%s",
            track.index, track.mime.c_str(), track.width, track.height, layout.width,
-           layout.height, track.frame_rate, static_cast<long long>(track.duration_us),
-           opt.input.c_str());
+           layout.height, track.frame_rate, opt.fps_cap,
+           static_cast<long long>(track.duration_us), opt.input.c_str());
       stream_logged = true;
     }
     return true;
@@ -1096,7 +1144,9 @@ DecodeOutcome DecodeOnce(const Options &opt, BinderClient *binder,
   bool clock_started = false;
   int64_t base_wall_us = 0;
   int64_t base_pts_us = 0;
+  int64_t last_published_pts_us = -1;
   uint64_t decoded = 0;
+  uint64_t dropped = 0;
   int64_t fps_window_us = MonotonicUs();
   int64_t variant_probe_us = fps_window_us;
   uint64_t fps_frames = 0;
@@ -1172,6 +1222,21 @@ DecodeOutcome DecodeOnce(const Options &opt, BinderClient *binder,
           return DecodeOutcome::kFailed;
         }
       }
+      const int64_t pts_us = info.presentationTimeUs;
+      if (!output_eos &&
+          ShouldDropForFpsCap(opt, pts_us, clock_started, base_wall_us,
+                              base_pts_us, last_published_pts_us)) {
+        dropped += 1;
+        if (dropped <= 5 || (dropped % 120) == 0) {
+          LOGI("MediaCodecPlayer: dropped decoded frame #%llu cap=%d pts=%lld lastPts=%lld input=%s",
+               static_cast<unsigned long long>(dropped), opt.fps_cap,
+               static_cast<long long>(pts_us),
+               static_cast<long long>(last_published_pts_us),
+               opt.input.c_str());
+        }
+        AMediaCodec_releaseOutputBuffer(codec, static_cast<size_t>(output_index), false);
+        continue;
+      }
       size_t output_size = 0;
       uint8_t *output = AMediaCodec_getOutputBuffer(codec, static_cast<size_t>(output_index),
                                                     &output_size);
@@ -1193,11 +1258,11 @@ DecodeOutcome DecodeOnce(const Options &opt, BinderClient *binder,
         cleanup();
         return DecodeOutcome::kFailed;
       }
-      const int64_t pts_us = info.presentationTimeUs;
       PaceFrame(pts_us, &clock_started, &base_wall_us, &base_pts_us);
       if (!WriteFrame(&ring, i420.data(), i420.size(), pts_us)) {
         LOGE("MediaCodecPlayer: WriteFrame failed");
       }
+      last_published_pts_us = pts_us;
       decoded += 1;
       fps_frames += 1;
       if (decoded <= 5 || (decoded % 120) == 0) {
@@ -1225,8 +1290,9 @@ DecodeOutcome DecodeOnce(const Options &opt, BinderClient *binder,
   }
 
   if (ring_registered) {
-    LOGI("MediaCodecPlayer: decode pass complete frames=%llu eos=%d stop=%d",
-         static_cast<unsigned long long>(decoded), output_eos ? 1 : 0,
+    LOGI("MediaCodecPlayer: decode pass complete frames=%llu dropped=%llu eos=%d stop=%d",
+         static_cast<unsigned long long>(decoded),
+         static_cast<unsigned long long>(dropped), output_eos ? 1 : 0,
          g_stop.load(std::memory_order_acquire) ? 1 : 0);
   }
   cleanup();
@@ -1254,8 +1320,9 @@ int main(int argc, char **argv) {
   std::string current_input = opt.auto_variant
                                   ? ResolveAutoVariantInput(&binder, opt.input, "start")
                                   : opt.input;
-  LOGI("MediaCodecPlayer: initial input=%s autoVariant=%d default=%s",
-       current_input.c_str(), opt.auto_variant ? 1 : 0, opt.input.c_str());
+  LOGI("MediaCodecPlayer: initial input=%s autoVariant=%d fpsCap=%d default=%s",
+       current_input.c_str(), opt.auto_variant ? 1 : 0, opt.fps_cap,
+       opt.input.c_str());
   do {
     loops += 1;
     Options pass = opt;
