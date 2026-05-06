@@ -1,7 +1,7 @@
 <resources>
     <string name="app_name">awesomeCAM</string>
     <string name="miuix_badge">MINIMALISM 2.0</string>
-    <string name="miuix_home_subtitle">A focused control surface for cameraserver injection, native FFmpeg playback, and live verification.</string>
+    <string name="miuix_home_subtitle">A focused control surface for cameraserver injection, prescaled MediaCodec playback, and live verification.</string>
     <string name="miuix_pipeline_title">Controls</string>
     <string name="miuix_pipeline_subtitle">Direct controls for injection, native playback, service restart, and telemetry.</string>
     <string name="miuix_logs_card_title">Diagnostics</string>

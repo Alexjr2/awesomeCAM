@@ -40,24 +40,32 @@ set_target_properties(hook PROPERTIES
 
 add_library(streamclient SHARED streamclient.cpp video2camera_ndk.cpp)
 
+add_library(ffmpeg_packager SHARED
+    ffmpeg_packager.cpp
+)
+
 find_library(log-lib log)
 find_library(dl-lib dl)
 find_library(m-lib m)
 find_library(android-lib android)
+find_library(mediandk-lib mediandk)
 
 target_include_directories(injector_helper PRIVATE "${CMAKE_SOURCE_DIR}")
 target_include_directories(awesomecam_player PRIVATE "${CMAKE_SOURCE_DIR}")
 target_include_directories(hook PRIVATE "${CMAKE_SOURCE_DIR}")
 target_include_directories(streamclient PRIVATE "${CMAKE_SOURCE_DIR}")
+target_include_directories(ffmpeg_packager PRIVATE "${CMAKE_SOURCE_DIR}")
 
 target_compile_options(injector_helper PRIVATE -ffunction-sections -fdata-sections -fno-exceptions -fno-rtti)
 target_link_options(injector_helper PRIVATE -Wl,--gc-sections -Wl,-z,max-page-size=16384)
 
 target_link_options(hook PRIVATE -Wl,-z,max-page-size=16384)
 target_link_options(streamclient PRIVATE -Wl,-z,max-page-size=16384)
+target_link_options(ffmpeg_packager PRIVATE -Wl,-z,max-page-size=16384)
 target_link_options(awesomecam_player PRIVATE -Wl,-z,max-page-size=16384 -Wl,-rpath,/data/camera)
 
 target_link_libraries(injector_helper ${log-lib} ${dl-lib} ${m-lib})
-target_link_libraries(awesomecam_player ffmpeg::ffmpeg ${log-lib} ${dl-lib} ${android-lib})
+target_link_libraries(awesomecam_player ${log-lib} ${dl-lib} ${android-lib} ${mediandk-lib})
 target_link_libraries(hook shadowhook::shadowhook ${log-lib} ${dl-lib})
 target_link_libraries(streamclient ${log-lib} ${dl-lib})
+target_link_libraries(ffmpeg_packager ffmpeg::ffmpeg)

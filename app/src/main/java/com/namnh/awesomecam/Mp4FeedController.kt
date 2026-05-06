@@ -18,22 +18,22 @@ class Mp4FeedController(
     fun start(path: String = DEFAULT_VIDEO_PATH, displayName: String? = null) {
         if (isRunning) return
         active = true
-        worker = thread(start = true, name = "ffmpeg-player-control") {
+        worker = thread(start = true, name = "mediacodec-player-control") {
             try {
                 if (refreshRunningState()) {
-                    postStatus("Video feed: native FFmpeg player is already running")
+                    postStatus("Video feed: native MediaCodec player is already running")
                     return@thread
                 }
 
                 val source = prepareReadableSource(path)
                 active = true
                 val sourceLabel = displayName?.takeIf { it.isNotBlank() } ?: "staged video"
-                postStatus("Video feed: starting native FFmpeg player for $sourceLabel")
+                postStatus("Video feed: starting native MediaCodec player for $sourceLabel")
                 val output = runRoot(buildStartCommands(source))
                 active = parseStartedPid(output) != null
                 postStatus("Video feed: native player start requested\n$output")
                 if (active) {
-                    postStatus("Video feed: open camera/webcam preview and watch FFmpegPlayer + source=FFmpegPlayback logs")
+                    postStatus("Video feed: open camera/webcam preview and watch MediaCodecPlayer + source=MediaCodecPlayback logs")
                 } else {
                     postStatus("Video feed: player PID was not observed; check /data/camera/awesomecam_player.log")
                 }
@@ -47,7 +47,7 @@ class Mp4FeedController(
     }
 
     fun stop() {
-        thread(start = true, name = "ffmpeg-player-stop") {
+        thread(start = true, name = "mediacodec-player-stop") {
             val output = stopBlocking()
             postStatus("Video feed: native player stop requested; source cache cleared\n$output")
         }
@@ -64,7 +64,7 @@ class Mp4FeedController(
     }
 
     fun refreshRunningStateAsync(onComplete: (Boolean) -> Unit = {}) {
-        thread(start = true, name = "ffmpeg-player-probe") {
+        thread(start = true, name = "mediacodec-player-probe") {
             val running = refreshRunningState()
             onComplete(running)
         }
@@ -89,16 +89,53 @@ class Mp4FeedController(
         return source.absolutePath
     }
 
-    private fun buildStartCommands(source: String): List<String> = listOf(
-        "mkdir -p ${shellQuote(RUNTIME_DIR)}",
-        "if [ ! -r ${shellQuote(source)} ]; then echo 'ERROR: no staged video found; choose a video first'; exit 1; fi",
-        "rm -f ${shellQuote(PLAYER_PID)}",
-        "export LD_LIBRARY_PATH=${shellQuote(RUNTIME_DIR)}:\${LD_LIBRARY_PATH}",
-        "cd ${shellQuote(RUNTIME_DIR)}",
-        "${shellQuote(PLAYER_PATH)} --input ${shellQuote(source)} --loop --pidfile ${shellQuote(PLAYER_PID)} >> ${shellQuote(PLAYER_LOG)} 2>&1 &",
-        "sleep 0.2",
-        "cat ${shellQuote(PLAYER_PID)} 2>/dev/null || true",
-    )
+    private fun buildStartCommands(source: String): List<String> = buildList {
+        add("mkdir -p ${shellQuote(RUNTIME_DIR)}")
+        add("rm -f ${shellQuote(PLAYER_PID)}")
+        add("export LD_LIBRARY_PATH=${shellQuote(RUNTIME_DIR)}:${'$'}{LD_LIBRARY_PATH}")
+        add("cd ${shellQuote(RUNTIME_DIR)}")
+        if (source == DEFAULT_VIDEO_PATH) {
+            add(buildVariantSelectionCommand())
+        } else {
+            add("SOURCE=${shellQuote(source)}")
+        }
+        add("if [ ! -r \"${'$'}SOURCE\" ]; then echo \"ERROR: selected prescaled video missing/unreadable: ${'$'}SOURCE\"; exit 1; fi")
+        add("${shellQuote(PLAYER_PATH)} --input \"${'$'}SOURCE\" --auto-variant --loop --pidfile ${shellQuote(PLAYER_PID)} >> ${shellQuote(PLAYER_LOG)} 2>&1 &")
+        add("sleep 0.5")
+        add(
+            """
+            pid="$(cat ${shellQuote(PLAYER_PID)} 2>/dev/null | head -n 1)"
+            if [ -n "${'$'}pid" ] && kill -0 "${'$'}pid" 2>/dev/null; then
+              echo "${'$'}pid"
+            else
+              echo "ERROR: MediaCodec player did not stay running"
+              tail -n 80 ${shellQuote(PLAYER_LOG)} 2>/dev/null || true
+              exit 1
+            fi
+            """.trimIndent(),
+        )
+    }
+
+    private fun buildVariantSelectionCommand(): String {
+        return """
+            VARIANT='1440x1080'
+            if [ -r ${shellQuote(VARIANT_OVERRIDE_PATH)} ]; then
+              CANDIDATE="$(head -n 1 ${shellQuote(VARIANT_OVERRIDE_PATH)} 2>/dev/null | tr -d '[:space:]')"
+              case "${'$'}CANDIDATE" in
+                1440x1080|1280x720|1920x1080|640x480)
+                  VARIANT="${'$'}CANDIDATE"
+                  ;;
+                "")
+                  ;;
+                *)
+                  echo "WARN: invalid awesomecam_variant '${'$'}CANDIDATE'; defaulting to 1440x1080"
+                  ;;
+              esac
+            fi
+            SOURCE="$RUNTIME_DIR/input_${'$'}{VARIANT}.mp4"
+            echo "SELECTED_VARIANT ${'$'}VARIANT ${'$'}SOURCE"
+        """.trimIndent()
+    }
 
     private fun buildStopCommands(): List<String> = listOf(
         "if [ -f ${shellQuote(PLAYER_PID)} ]; then kill -TERM $(cat ${shellQuote(PLAYER_PID)}) 2>/dev/null || true; fi",
@@ -170,10 +207,12 @@ class Mp4FeedController(
     }
 
     companion object {
-        const val DEFAULT_VIDEO_PATH: String = "/data/camera/input.mp4"
+        const val STAGED_INPUT_PATH: String = "/data/camera/input.mp4"
+        const val DEFAULT_VIDEO_PATH: String = "/data/camera/input_1440x1080.mp4"
         private const val RUNTIME_DIR = "/data/camera"
         private const val PLAYER_PATH = "$RUNTIME_DIR/awesomecam_player"
         private const val PLAYER_PID = "$RUNTIME_DIR/awesomecam_player.pid"
         private const val PLAYER_LOG = "$RUNTIME_DIR/awesomecam_player.log"
+        private const val VARIANT_OVERRIDE_PATH = "$RUNTIME_DIR/awesomecam_variant"
     }
 }

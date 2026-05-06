@@ -37,7 +37,7 @@ android {
         versionName = "2.7"
         buildConfigField("String", "GIT_SHA", "\"${gitShortSha()}\"")
         buildConfigField("String", "BUILD_STAMP", "\"${buildStamp()}\"")
-        buildConfigField("String", "ARCH_LABEL", "\"ffmpeg-native-player\"")
+        buildConfigField("String", "ARCH_LABEL", "\"mediacodec-prescaled-player\"")
 
         ndk {
             abiFilters += listOf("arm64-v8a")

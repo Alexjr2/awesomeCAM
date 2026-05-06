@@ -4,6 +4,9 @@
 #include <android/sharedmem.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <media/NdkMediaCodec.h>
+#include <media/NdkMediaExtractor.h>
+#include <media/NdkMediaFormat.h>
 #include <signal.h>
 #include <string.h>
 #include <sys/mman.h>
@@ -14,19 +17,10 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cinttypes>
 #include <string>
 #include <thread>
 #include <vector>
-
-extern "C" {
-#include <libavcodec/avcodec.h>
-#include <libavformat/avformat.h>
-#include <libavutil/imgutils.h>
-#include <libavutil/log.h>
-#include <libavutil/pixfmt.h>
-#include <libavutil/rational.h>
-#include <libswscale/swscale.h>
-}
 
 #include "video2camera_ipc.h"
 #include "video2camera_ndk.h"
@@ -40,12 +34,18 @@ namespace {
 
 std::atomic<bool> g_stop{false};
 
+constexpr int32_t kColorFormatYuv420Planar = 19;
+constexpr int32_t kColorFormatYuv420PackedPlanar = 20;
+constexpr int32_t kColorFormatYuv420SemiPlanar = 21;
+constexpr int32_t kColorFormatYuv420PackedSemiPlanar = 39;
+constexpr int32_t kColorFormatYuv420Flexible = 0x7f420888;
+constexpr int64_t kCodecIoTimeoutUs = 10000;
+
 struct Options {
-  std::string input = "/data/camera/input.mp4";
+  std::string input = "/data/camera/input_1440x1080.mp4";
   std::string pidfile = "/data/camera/awesomecam_player.pid";
   bool loop = true;
-  int max_long = 1920;
-  int max_short = 1080;
+  bool auto_variant = true;
 };
 
 struct BinderClient {
@@ -72,11 +72,74 @@ struct SourceRing {
     size = 0;
     if (fd >= 0) close(fd);
     fd = -1;
+    width = 0;
+    height = 0;
+    slot_size = 0;
+    next_slot = 0;
+    next_generation = 0;
   }
 
   awesomecam::SharedMemoryRingHeader *header() const {
     return reinterpret_cast<awesomecam::SharedMemoryRingHeader *>(addr);
   }
+};
+
+enum class OutputLayoutKind {
+  kUnknown,
+  kPlanar,
+  kSemiPlanar,
+};
+
+struct OutputLayout {
+  int32_t width = 0;
+  int32_t height = 0;
+  int32_t stride = 0;
+  int32_t slice_height = 0;
+  int32_t crop_left = 0;
+  int32_t crop_top = 0;
+  int32_t color_format = 0;
+  OutputLayoutKind kind = OutputLayoutKind::kUnknown;
+  bool chroma_swapped = false;
+};
+
+struct TrackInfo {
+  size_t index = 0;
+  std::string mime;
+  int32_t width = 0;
+  int32_t height = 0;
+  int32_t frame_rate = 0;
+  int64_t duration_us = -1;
+  AMediaFormat *format = nullptr;
+};
+
+struct TargetSnapshot {
+  int32_t width = 0;
+  int32_t height = 0;
+  int32_t format = 0;
+  uint64_t generation = 0;
+  int64_t last_seen_ns = 0;
+  uint64_t hit_count = 0;
+};
+
+struct VariantSpec {
+  const char *name;
+  int32_t width;
+  int32_t height;
+  const char *path;
+};
+
+constexpr VariantSpec kVariantSpecs[] = {
+    {"1440x1080", 1440, 1080, "/data/camera/input_1440x1080.mp4"},
+    {"1280x720", 1280, 720, "/data/camera/input_1280x720.mp4"},
+    {"1920x1080", 1920, 1080, "/data/camera/input_1920x1080.mp4"},
+    {"640x480", 640, 480, "/data/camera/input_640x480.mp4"},
+};
+
+enum class DecodeOutcome {
+  kFailed,
+  kEof,
+  kStopped,
+  kSwitchInput,
 };
 
 void SignalHandler(int) { g_stop.store(true, std::memory_order_release); }
@@ -103,8 +166,16 @@ int64_t MonotonicUs() {
   return static_cast<int64_t>(ts.tv_sec) * 1000000LL + ts.tv_nsec / 1000LL;
 }
 
+size_t ChromaWidth(int32_t width) { return static_cast<size_t>((width + 1) / 2); }
+size_t ChromaHeight(int32_t height) { return static_cast<size_t>((height + 1) / 2); }
+
+bool StartsWith(const std::string &value, const char *prefix) {
+  const size_t len = strlen(prefix);
+  return value.size() >= len && value.compare(0, len, prefix) == 0;
+}
+
 void PrintUsage() {
-  LOGI("FFmpegPlayer usage: awesomecam_player --input /data/camera/input.mp4 --loop --pidfile /data/camera/awesomecam_player.pid");
+  LOGI("MediaCodecPlayer usage: awesomecam_player --input /data/camera/input_1440x1080.mp4 --loop --pidfile /data/camera/awesomecam_player.pid");
 }
 
 Options ParseOptions(int argc, char **argv) {
@@ -113,7 +184,7 @@ Options ParseOptions(int argc, char **argv) {
     const std::string arg = argv[i] ? argv[i] : "";
     auto need_value = [&](const char *name) -> const char * {
       if (i + 1 >= argc) {
-        LOGW("FFmpegPlayer missing value for %s", name);
+        LOGW("MediaCodecPlayer: missing value for %s", name);
         return nullptr;
       }
       return argv[++i];
@@ -126,12 +197,14 @@ Options ParseOptions(int argc, char **argv) {
       opt.loop = false;
     } else if (arg == "--loop") {
       opt.loop = true;
-    } else if (arg == "--max-long") {
-      if (const char *v = need_value("--max-long")) opt.max_long = std::max(2, atoi(v));
-    } else if (arg == "--max-short") {
-      if (const char *v = need_value("--max-short")) opt.max_short = std::max(2, atoi(v));
-    } else if (arg == "--service") {
-      (void)need_value("--service");
+    } else if (arg == "--auto-variant") {
+      opt.auto_variant = true;
+    } else if (arg == "--fixed-input") {
+      opt.auto_variant = false;
+    } else if (arg == "--max-long" || arg == "--max-short" || arg == "--service") {
+      // Kept for CLI compatibility with the older FFmpeg player.  Playback now
+      // expects already-prescaled input and does not resize while decoding.
+      (void)need_value(arg.c_str());
     } else if (arg == "--help" || arg == "-h") {
       PrintUsage();
     }
@@ -143,7 +216,7 @@ void WritePidFile(const std::string &path) {
   if (path.empty()) return;
   int fd = open(path.c_str(), O_CREAT | O_TRUNC | O_WRONLY | O_CLOEXEC, 0644);
   if (fd < 0) {
-    LOGW("FFmpegPlayer: open pidfile %s failed errno=%d", path.c_str(), errno);
+    LOGW("MediaCodecPlayer: open pidfile %s failed errno=%d", path.c_str(), errno);
     return;
   }
   char buf[64];
@@ -155,29 +228,187 @@ void WritePidFile(const std::string &path) {
 bool ConnectService(BinderClient *client) {
   if (client == nullptr) return false;
   if (!awesomecam::LoadBinderRuntimeApi(&client->api)) {
-    LOGE("FFmpegPlayer: failed to load binder runtime");
+    LOGE("MediaCodecPlayer: failed to load binder runtime");
     return false;
   }
+  client->api.set_thread_pool_max(1);
+  client->api.start_thread_pool();
+  LOGI("MediaCodecPlayer: binder threadpool started");
   if (client->client_class == nullptr) {
     client->client_class = client->api.binder_class_define(
         awesomecam::kVideo2CameraDescriptor, ClientOnCreate, ClientOnDestroy, ClientOnTransact);
     if (client->client_class == nullptr) {
-      LOGE("FFmpegPlayer: failed to define binder client class");
+      LOGE("MediaCodecPlayer: failed to define binder client class");
       return false;
     }
   }
   client->remote = client->api.wait_for_service(awesomecam::kVideo2CameraServiceName);
   if (client->remote == nullptr) {
-    LOGE("FFmpegPlayer: Video2CameraService unavailable");
+    LOGE("MediaCodecPlayer: Video2CameraService unavailable");
     return false;
   }
   if (!client->api.binder_associate_class(client->remote, client->client_class)) {
-    LOGE("FFmpegPlayer: AIBinder_associateClass failed remote=%p", client->remote);
+    LOGE("MediaCodecPlayer: AIBinder_associateClass failed remote=%p", client->remote);
     return false;
   }
-  LOGI("FFmpegPlayer: connected to %s remote=%p", awesomecam::kVideo2CameraServiceName,
+  LOGI("MediaCodecPlayer: connected to %s remote=%p", awesomecam::kVideo2CameraServiceName,
        client->remote);
   return true;
+}
+
+bool IsReadableRegularFile(const std::string &path) {
+  struct stat st {};
+  return !path.empty() && access(path.c_str(), R_OK) == 0 &&
+         stat(path.c_str(), &st) == 0 && S_ISREG(st.st_mode) && st.st_size > 0;
+}
+
+const VariantSpec *FindVariantByName(const std::string &name) {
+  for (const VariantSpec &variant : kVariantSpecs) {
+    if (name == variant.name) return &variant;
+  }
+  return nullptr;
+}
+
+const VariantSpec *FindVariantBySize(int32_t width, int32_t height) {
+  for (const VariantSpec &variant : kVariantSpecs) {
+    if (variant.width == width && variant.height == height) return &variant;
+  }
+  return nullptr;
+}
+
+std::string ReadVariantOverride() {
+  int fd = open("/data/camera/awesomecam_variant", O_RDONLY | O_CLOEXEC);
+  if (fd < 0) return "";
+  char buf[64];
+  const ssize_t n = read(fd, buf, sizeof(buf) - 1);
+  close(fd);
+  if (n <= 0) return "";
+  buf[n] = '\0';
+  std::string value(buf);
+  value.erase(std::remove_if(value.begin(), value.end(), [](char ch) {
+                return ch == ' ' || ch == '\t' || ch == '\r' || ch == '\n';
+              }),
+              value.end());
+  return value;
+}
+
+bool QueryTargets(BinderClient *client, std::vector<TargetSnapshot> *targets) {
+  if (client == nullptr || client->remote == nullptr || targets == nullptr) return false;
+  targets->clear();
+  AParcel *in = nullptr;
+  AParcel *out = nullptr;
+  binder_status_t status = client->api.binder_prepare_transaction(client->remote, &in);
+  if (status == STATUS_OK) {
+    status = client->api.binder_transact(client->remote, awesomecam::kTxnGetTargets,
+                                         &in, &out, 0);
+  }
+  int32_t count = 0;
+  if (status == STATUS_OK && out != nullptr) {
+    status = client->api.parcel_read_int32(out, &count);
+  }
+  if (status == STATUS_OK && count > 0 && count < 64) {
+    targets->reserve(static_cast<size_t>(count));
+    for (int32_t i = 0; i < count; ++i) {
+      TargetSnapshot target{};
+      int64_t generation = 0;
+      int64_t hit_count = 0;
+      if (status == STATUS_OK) status = client->api.parcel_read_int32(out, &target.width);
+      if (status == STATUS_OK) status = client->api.parcel_read_int32(out, &target.height);
+      if (status == STATUS_OK) status = client->api.parcel_read_int32(out, &target.format);
+      if (status == STATUS_OK) status = client->api.parcel_read_int64(out, &generation);
+      if (status == STATUS_OK) status = client->api.parcel_read_int64(out, &target.last_seen_ns);
+      if (status == STATUS_OK) status = client->api.parcel_read_int64(out, &hit_count);
+      if (status != STATUS_OK) break;
+      target.generation = generation > 0 ? static_cast<uint64_t>(generation) : 0;
+      target.hit_count = hit_count > 0 ? static_cast<uint64_t>(hit_count) : 0;
+      targets->push_back(target);
+    }
+  }
+  if (in != nullptr) client->api.parcel_delete(in);
+  if (out != nullptr) client->api.parcel_delete(out);
+  return status == STATUS_OK;
+}
+
+std::string ResolveAutoVariantInput(BinderClient *client, const std::string &fallback,
+                                    const char *reason) {
+  constexpr int64_t kFreshTargetNs = 1500000000LL;
+  const std::string override_name = ReadVariantOverride();
+  if (!override_name.empty()) {
+    const VariantSpec *variant = FindVariantByName(override_name);
+    if (variant != nullptr && IsReadableRegularFile(variant->path)) {
+      if (fallback != variant->path) {
+        LOGI("MediaCodecPlayer: selected override variant %s path=%s reason=%s",
+             variant->name, variant->path, reason != nullptr ? reason : "auto");
+      }
+      return variant->path;
+    }
+    if (variant == nullptr) {
+      LOGW("MediaCodecPlayer: invalid awesomecam_variant '%s'; using auto/default",
+           override_name.c_str());
+    } else {
+      LOGW("MediaCodecPlayer: override variant %s missing path=%s; using auto/default",
+           variant->name, variant->path);
+    }
+  }
+
+  std::vector<TargetSnapshot> targets;
+  if (QueryTargets(client, &targets)) {
+    static std::string last_unmatched_target;
+    static std::string last_stale_target;
+    const int64_t now_ns = MonotonicUs() * 1000LL;
+    for (const TargetSnapshot &target : targets) {
+      const int64_t age_ns = target.last_seen_ns > 0 ? now_ns - target.last_seen_ns : 0;
+      if (target.last_seen_ns > 0 && age_ns > kFreshTargetNs) {
+        char key[96];
+        snprintf(key, sizeof(key), "%dx%d age=%.1fs", target.width, target.height,
+                 static_cast<double>(age_ns) / 1000000000.0);
+        if (last_stale_target != key) {
+          LOGI("MediaCodecPlayer: ignoring stale camera target %s; using %s",
+               key, fallback.c_str());
+          last_stale_target = key;
+        }
+        continue;
+      }
+      const VariantSpec *variant = FindVariantBySize(target.width, target.height);
+      if (variant == nullptr) {
+        char key[64];
+        snprintf(key, sizeof(key), "%dx%d", target.width, target.height);
+        if (last_unmatched_target != key) {
+          LOGI("MediaCodecPlayer: target %s has no exact mp4 variant; using ReadyFrameCache scaler from %s",
+               key, fallback.c_str());
+          last_unmatched_target = key;
+        }
+        continue;
+      }
+      if (!IsReadableRegularFile(variant->path)) {
+        LOGW("MediaCodecPlayer: target %dx%d has variant %s but file missing path=%s",
+             target.width, target.height, variant->name, variant->path);
+        continue;
+      }
+      if (fallback != variant->path) {
+        LOGI("MediaCodecPlayer: selected target variant %s path=%s hits=%llu reason=%s",
+             variant->name, variant->path,
+             static_cast<unsigned long long>(target.hit_count),
+             reason != nullptr ? reason : "auto");
+      }
+      return variant->path;
+    }
+    static bool logged_no_active_fresh = false;
+    if (!logged_no_active_fresh && targets.empty()) {
+      LOGI("MediaCodecPlayer: no active camera target yet; using default input %s",
+           fallback.c_str());
+      logged_no_active_fresh = true;
+    }
+  } else {
+    static bool logged_query_failed = false;
+    if (!logged_query_failed) {
+      LOGW("MediaCodecPlayer: target query failed; using default input %s",
+           fallback.c_str());
+      logged_query_failed = true;
+    }
+  }
+
+  return fallback;
 }
 
 bool RegisterSourceRing(BinderClient *client, const SourceRing &ring) {
@@ -206,10 +437,11 @@ bool RegisterSourceRing(BinderClient *client, const SourceRing &ring) {
   if (in != nullptr) client->api.parcel_delete(in);
   if (out != nullptr) client->api.parcel_delete(out);
   if (status != STATUS_OK || ack != 1) {
-    LOGE("FFmpegPlayer: register source ring failed step=%s status=%d ack=%d", failed_step, status, ack);
+    LOGE("MediaCodecPlayer: register source ring failed step=%s status=%d ack=%d",
+         failed_step, status, ack);
     return false;
   }
-  LOGI("FFmpegPlayer: source ring registered %dx%d slot=%u region=%zu",
+  LOGI("MediaCodecPlayer: source ring registered %dx%d slot=%u region=%zu",
        ring.width, ring.height, ring.slot_size, ring.size);
   return true;
 }
@@ -232,14 +464,14 @@ bool InitSourceRing(SourceRing *ring, int32_t width, int32_t height) {
   const size_t region_size = awesomecam::SharedMemoryRingSize(width, height);
   if (slot_size == 0 || region_size <= sizeof(awesomecam::SharedMemoryRingHeader)) return false;
 
-  ring->fd = ASharedMemory_create("awesomecam_ffmpeg_source", region_size);
+  ring->fd = ASharedMemory_create("awesomecam_mediacodec_source", region_size);
   if (ring->fd < 0) {
-    LOGE("FFmpegPlayer: ASharedMemory_create failed errno=%d", errno);
+    LOGE("MediaCodecPlayer: ASharedMemory_create failed errno=%d", errno);
     return false;
   }
   ring->addr = mmap(nullptr, region_size, PROT_READ | PROT_WRITE, MAP_SHARED, ring->fd, 0);
   if (ring->addr == MAP_FAILED) {
-    LOGE("FFmpegPlayer: mmap source ring failed errno=%d", errno);
+    LOGE("MediaCodecPlayer: mmap source ring failed errno=%d", errno);
     ring->addr = nullptr;
     ring->reset();
     return false;
@@ -289,28 +521,6 @@ bool WriteFrame(SourceRing *ring, const uint8_t *i420, size_t size, int64_t pts_
   return true;
 }
 
-void ComputeOutputSize(int src_w, int src_h, int max_long, int max_short,
-                       int *out_w, int *out_h) {
-  int long_edge = std::max(src_w, src_h);
-  int short_edge = std::min(src_w, src_h);
-  double scale = 1.0;
-  if (long_edge > max_long) scale = std::min(scale, static_cast<double>(max_long) / long_edge);
-  if (short_edge > max_short) scale = std::min(scale, static_cast<double>(max_short) / short_edge);
-  int w = std::max(2, static_cast<int>(src_w * scale + 0.5));
-  int h = std::max(2, static_cast<int>(src_h * scale + 0.5));
-  w &= ~1;
-  h &= ~1;
-  *out_w = std::max(2, w);
-  *out_h = std::max(2, h);
-}
-
-int64_t FramePtsUs(const AVFrame *frame, AVRational time_base) {
-  int64_t pts = frame->best_effort_timestamp;
-  if (pts == AV_NOPTS_VALUE) pts = frame->pts;
-  if (pts == AV_NOPTS_VALUE) return -1;
-  return av_rescale_q(pts, time_base, AVRational{1, 1000000});
-}
-
 void PaceFrame(int64_t pts_us, bool *clock_started, int64_t *base_wall_us,
                int64_t *base_pts_us) {
   if (pts_us < 0 || clock_started == nullptr || base_wall_us == nullptr ||
@@ -331,160 +541,633 @@ void PaceFrame(int64_t pts_us, bool *clock_started, int64_t *base_wall_us,
   }
 }
 
-bool DecodeOnce(const Options &opt, BinderClient *binder) {
-  AVFormatContext *fmt = nullptr;
-  AVCodecContext *codec_ctx = nullptr;
-  AVPacket *pkt = nullptr;
-  AVFrame *frame = nullptr;
-  AVFrame *dst_frame = nullptr;
-  SwsContext *sws = nullptr;
+bool PreferMediaCodecNv21() {
+  return access("/data/camera/awesomecam_mediacodec_nv21", F_OK) == 0;
+}
+
+bool ReadInt32(AMediaFormat *fmt, const char *key, int32_t fallback, int32_t *out) {
+  if (out == nullptr) return false;
+  int32_t value = fallback;
+  const bool present = fmt != nullptr && AMediaFormat_getInt32(fmt, key, &value);
+  *out = value;
+  return present;
+}
+
+bool ReadCrop(AMediaFormat *fmt, int32_t width, int32_t height, int32_t *left,
+              int32_t *top, int32_t *right, int32_t *bottom) {
+  if (left == nullptr || top == nullptr || right == nullptr || bottom == nullptr) return false;
+  *left = 0;
+  *top = 0;
+  *right = std::max<int32_t>(0, width - 1);
+  *bottom = std::max<int32_t>(0, height - 1);
+
+  int32_t l = 0;
+  int32_t t = 0;
+  int32_t r = width - 1;
+  int32_t b = height - 1;
+  bool found = false;
+  if (fmt != nullptr && AMediaFormat_getRect(fmt, AMEDIAFORMAT_KEY_DISPLAY_CROP, &l, &t, &r, &b)) {
+    found = true;
+  } else if (fmt != nullptr &&
+             AMediaFormat_getInt32(fmt, "crop-left", &l) &&
+             AMediaFormat_getInt32(fmt, "crop-top", &t) &&
+             AMediaFormat_getInt32(fmt, "crop-right", &r) &&
+             AMediaFormat_getInt32(fmt, "crop-bottom", &b)) {
+    found = true;
+  }
+  if (found && l >= 0 && t >= 0 && r >= l && b >= t) {
+    *left = l;
+    *top = t;
+    *right = r;
+    *bottom = b;
+  }
+  return found;
+}
+
+const char *LayoutKindName(OutputLayoutKind kind) {
+  switch (kind) {
+    case OutputLayoutKind::kPlanar:
+      return "planar";
+    case OutputLayoutKind::kSemiPlanar:
+      return "semiplanar";
+    default:
+      return "unknown";
+  }
+}
+
+bool UpdateOutputLayout(AMediaFormat *fmt, int32_t fallback_w, int32_t fallback_h,
+                        OutputLayout *layout, bool log_errors = true) {
+  if (fmt == nullptr || layout == nullptr) return false;
+  int32_t coded_w = fallback_w;
+  int32_t coded_h = fallback_h;
+  ReadInt32(fmt, AMEDIAFORMAT_KEY_WIDTH, fallback_w, &coded_w);
+  ReadInt32(fmt, AMEDIAFORMAT_KEY_HEIGHT, fallback_h, &coded_h);
+  if (coded_w <= 0 || coded_h <= 0) {
+    if (log_errors) {
+      LOGE("MediaCodecPlayer: output format failed invalid coded size %dx%d format=%s",
+           coded_w, coded_h, AMediaFormat_toString(fmt));
+    }
+    return false;
+  }
+
+  int32_t color_format = 0;
+  if (!ReadInt32(fmt, AMEDIAFORMAT_KEY_COLOR_FORMAT, 0, &color_format) || color_format == 0) {
+    if (log_errors) {
+      LOGE("MediaCodecPlayer: output format failed missing color-format format=%s",
+           AMediaFormat_toString(fmt));
+    }
+    return false;
+  }
+
+  OutputLayoutKind kind = OutputLayoutKind::kUnknown;
+  switch (color_format) {
+    case kColorFormatYuv420Planar:
+    case kColorFormatYuv420PackedPlanar:
+      kind = OutputLayoutKind::kPlanar;
+      break;
+    case kColorFormatYuv420SemiPlanar:
+    case kColorFormatYuv420PackedSemiPlanar:
+    case kColorFormatYuv420Flexible:
+      kind = OutputLayoutKind::kSemiPlanar;
+      break;
+    default:
+      if (log_errors) {
+        LOGE("MediaCodecPlayer: unsupported color-format failed color=%#x format=%s",
+             color_format, AMediaFormat_toString(fmt));
+      }
+      return false;
+  }
+
+  int32_t stride = coded_w;
+  int32_t slice_height = coded_h;
+  ReadInt32(fmt, AMEDIAFORMAT_KEY_STRIDE, coded_w, &stride);
+  ReadInt32(fmt, AMEDIAFORMAT_KEY_SLICE_HEIGHT, coded_h, &slice_height);
+  if (stride <= 0) stride = coded_w;
+  if (slice_height <= 0) slice_height = coded_h;
+
+  int32_t crop_left = 0;
+  int32_t crop_top = 0;
+  int32_t crop_right = coded_w - 1;
+  int32_t crop_bottom = coded_h - 1;
+  ReadCrop(fmt, coded_w, coded_h, &crop_left, &crop_top, &crop_right, &crop_bottom);
+  int32_t visible_w = crop_right - crop_left + 1;
+  int32_t visible_h = crop_bottom - crop_top + 1;
+  if (visible_w <= 0 || visible_h <= 0) {
+    visible_w = coded_w;
+    visible_h = coded_h;
+    crop_left = 0;
+    crop_top = 0;
+  }
+  if ((visible_w & 1) != 0 && visible_w > 1) --visible_w;
+  if ((visible_h & 1) != 0 && visible_h > 1) --visible_h;
+  crop_left &= ~1;
+  crop_top &= ~1;
+
+  if (stride < crop_left + visible_w || slice_height < crop_top + visible_h) {
+    if (log_errors) {
+      LOGE("MediaCodecPlayer: output layout failed stride/slice too small stride=%d slice=%d crop=%d,%d %dx%d format=%s",
+           stride, slice_height, crop_left, crop_top, visible_w, visible_h,
+           AMediaFormat_toString(fmt));
+    }
+    return false;
+  }
+
+  layout->width = visible_w;
+  layout->height = visible_h;
+  layout->stride = stride;
+  layout->slice_height = slice_height;
+  layout->crop_left = crop_left;
+  layout->crop_top = crop_top;
+  layout->color_format = color_format;
+  layout->kind = kind;
+  layout->chroma_swapped = PreferMediaCodecNv21();
+  LOGI("MediaCodecPlayer: output layout kind=%s color=%#x visible=%dx%d coded=%dx%d stride=%d slice=%d crop=%d,%d nv21Override=%d",
+       LayoutKindName(kind), color_format, layout->width, layout->height, coded_w, coded_h,
+       layout->stride, layout->slice_height, layout->crop_left, layout->crop_top,
+       layout->chroma_swapped ? 1 : 0);
+  return true;
+}
+
+bool ConvertPlanarToI420(const uint8_t *src, size_t src_size, const OutputLayout &layout,
+                         std::vector<uint8_t> *dst) {
+  if (src == nullptr || dst == nullptr || layout.width <= 0 || layout.height <= 0) return false;
+  const size_t y_plane_size = static_cast<size_t>(layout.stride) * layout.slice_height;
+  const int32_t chroma_stride = std::max<int32_t>(1, layout.stride / 2);
+  const int32_t chroma_slice_height = std::max<int32_t>(1, layout.slice_height / 2);
+  const size_t chroma_plane_size = static_cast<size_t>(chroma_stride) * chroma_slice_height;
+  if (src_size < y_plane_size + 2 * chroma_plane_size) return false;
+
+  const size_t dst_size = awesomecam::I420FrameSize(layout.width, layout.height);
+  dst->resize(dst_size);
+  const size_t cw = ChromaWidth(layout.width);
+  const size_t ch = ChromaHeight(layout.height);
+  const size_t y_size = static_cast<size_t>(layout.width) * layout.height;
+  const size_t c_size = cw * ch;
+  uint8_t *dst_y = dst->data();
+  uint8_t *dst_u = dst_y + y_size;
+  uint8_t *dst_v = dst_u + c_size;
+
+  for (int32_t row = 0; row < layout.height; ++row) {
+    const size_t src_off = static_cast<size_t>(layout.crop_top + row) * layout.stride +
+                           layout.crop_left;
+    if (src_off + layout.width > src_size) return false;
+    memcpy(dst_y + static_cast<size_t>(row) * layout.width, src + src_off, layout.width);
+  }
+
+  const uint8_t *src_u_base = src + y_plane_size;
+  const uint8_t *src_v_base = src_u_base + chroma_plane_size;
+  const int32_t chroma_crop_left = layout.crop_left / 2;
+  const int32_t chroma_crop_top = layout.crop_top / 2;
+  for (size_t row = 0; row < ch; ++row) {
+    const size_t src_off = static_cast<size_t>(chroma_crop_top) * chroma_stride +
+                           row * chroma_stride + chroma_crop_left;
+    if (src_off + cw > chroma_plane_size) return false;
+    memcpy(dst_u + row * cw, src_u_base + src_off, cw);
+    memcpy(dst_v + row * cw, src_v_base + src_off, cw);
+  }
+  return true;
+}
+
+bool ConvertSemiPlanarToI420(const uint8_t *src, size_t src_size, const OutputLayout &layout,
+                             std::vector<uint8_t> *dst) {
+  if (src == nullptr || dst == nullptr || layout.width <= 0 || layout.height <= 0) return false;
+  const size_t y_plane_size = static_cast<size_t>(layout.stride) * layout.slice_height;
+  if (src_size < y_plane_size) return false;
+
+  const size_t dst_size = awesomecam::I420FrameSize(layout.width, layout.height);
+  dst->resize(dst_size);
+  const size_t cw = ChromaWidth(layout.width);
+  const size_t ch = ChromaHeight(layout.height);
+  const size_t y_size = static_cast<size_t>(layout.width) * layout.height;
+  const size_t c_size = cw * ch;
+  uint8_t *dst_y = dst->data();
+  uint8_t *dst_u = dst_y + y_size;
+  uint8_t *dst_v = dst_u + c_size;
+
+  for (int32_t row = 0; row < layout.height; ++row) {
+    const size_t src_off = static_cast<size_t>(layout.crop_top + row) * layout.stride +
+                           layout.crop_left;
+    if (src_off + layout.width > src_size) return false;
+    memcpy(dst_y + static_cast<size_t>(row) * layout.width, src + src_off, layout.width);
+  }
+
+  const uint8_t *src_uv = src + y_plane_size;
+  const size_t uv_size = src_size - y_plane_size;
+  const int32_t chroma_crop_top = layout.crop_top / 2;
+  const int32_t chroma_crop_left_bytes = layout.crop_left;
+  for (size_t row = 0; row < ch; ++row) {
+    const size_t row_off = static_cast<size_t>(chroma_crop_top) * layout.stride +
+                           row * layout.stride + chroma_crop_left_bytes;
+    if (row_off + cw * 2 > uv_size) return false;
+    const uint8_t *line = src_uv + row_off;
+    for (size_t col = 0; col < cw; ++col) {
+      if (layout.chroma_swapped) {
+        dst_v[row * cw + col] = line[col * 2 + 0];
+        dst_u[row * cw + col] = line[col * 2 + 1];
+      } else {
+        dst_u[row * cw + col] = line[col * 2 + 0];
+        dst_v[row * cw + col] = line[col * 2 + 1];
+      }
+    }
+  }
+  return true;
+}
+
+bool ConvertOutputToI420(const uint8_t *src, size_t src_size, const OutputLayout &layout,
+                         std::vector<uint8_t> *dst) {
+  switch (layout.kind) {
+    case OutputLayoutKind::kPlanar:
+      return ConvertPlanarToI420(src, src_size, layout, dst);
+    case OutputLayoutKind::kSemiPlanar:
+      return ConvertSemiPlanarToI420(src, src_size, layout, dst);
+    default:
+      return false;
+  }
+}
+
+bool OpenExtractor(const std::string &path, AMediaExtractor **out_extractor, int *out_fd) {
+  if (out_extractor == nullptr || out_fd == nullptr) return false;
+  *out_extractor = nullptr;
+  *out_fd = -1;
+  int fd = open(path.c_str(), O_RDONLY | O_CLOEXEC);
+  if (fd < 0) {
+    LOGE("MediaCodecPlayer: open input failed path=%s errno=%d (%s)",
+         path.c_str(), errno, strerror(errno));
+    return false;
+  }
+  struct stat st {};
+  if (fstat(fd, &st) != 0 || st.st_size <= 0) {
+    LOGE("MediaCodecPlayer: stat input failed path=%s errno=%d size=%lld",
+         path.c_str(), errno, static_cast<long long>(st.st_size));
+    close(fd);
+    return false;
+  }
+
+  AMediaExtractor *extractor = AMediaExtractor_new();
+  if (extractor == nullptr) {
+    LOGE("MediaCodecPlayer: AMediaExtractor_new failed");
+    close(fd);
+    return false;
+  }
+  const media_status_t status = AMediaExtractor_setDataSourceFd(
+      extractor, fd, 0, static_cast<off64_t>(st.st_size));
+  if (status != AMEDIA_OK) {
+    LOGE("MediaCodecPlayer: AMediaExtractor_setDataSourceFd failed status=%d path=%s",
+         status, path.c_str());
+    AMediaExtractor_delete(extractor);
+    close(fd);
+    return false;
+  }
+  *out_extractor = extractor;
+  *out_fd = fd;
+  return true;
+}
+
+bool FindVideoTrack(AMediaExtractor *extractor, TrackInfo *track) {
+  if (extractor == nullptr || track == nullptr) return false;
+  const size_t count = AMediaExtractor_getTrackCount(extractor);
+  for (size_t i = 0; i < count; ++i) {
+    AMediaFormat *fmt = AMediaExtractor_getTrackFormat(extractor, i);
+    if (fmt == nullptr) continue;
+    const char *mime_c = nullptr;
+    if (!AMediaFormat_getString(fmt, AMEDIAFORMAT_KEY_MIME, &mime_c) || mime_c == nullptr) {
+      AMediaFormat_delete(fmt);
+      continue;
+    }
+    std::string mime = mime_c;
+    if (!StartsWith(mime, "video/")) {
+      AMediaFormat_delete(fmt);
+      continue;
+    }
+    int32_t width = 0;
+    int32_t height = 0;
+    if (!AMediaFormat_getInt32(fmt, AMEDIAFORMAT_KEY_WIDTH, &width) ||
+        !AMediaFormat_getInt32(fmt, AMEDIAFORMAT_KEY_HEIGHT, &height) ||
+        width <= 0 || height <= 0) {
+      LOGE("MediaCodecPlayer: video track format failed missing size format=%s",
+           AMediaFormat_toString(fmt));
+      AMediaFormat_delete(fmt);
+      return false;
+    }
+    int32_t frame_rate = 0;
+    int64_t duration_us = -1;
+    AMediaFormat_getInt32(fmt, AMEDIAFORMAT_KEY_FRAME_RATE, &frame_rate);
+    AMediaFormat_getInt64(fmt, AMEDIAFORMAT_KEY_DURATION, &duration_us);
+    track->index = i;
+    track->mime = mime;
+    track->width = width;
+    track->height = height;
+    track->frame_rate = frame_rate;
+    track->duration_us = duration_us;
+    track->format = fmt;
+    return true;
+  }
+  LOGE("MediaCodecPlayer: no video stream found tracks=%zu", count);
+  return false;
+}
+
+bool QueueExtractorInput(AMediaCodec *codec, AMediaExtractor *extractor, bool *input_eos) {
+  static std::atomic<uint64_t> queued_input_count{0};
+  if (codec == nullptr || extractor == nullptr || input_eos == nullptr || *input_eos) {
+    return true;
+  }
+  const ssize_t input_index = AMediaCodec_dequeueInputBuffer(codec, kCodecIoTimeoutUs);
+  if (input_index == AMEDIACODEC_INFO_TRY_AGAIN_LATER) return true;
+  if (input_index < 0) {
+    LOGE("MediaCodecPlayer: dequeueInputBuffer failed rc=%zd", input_index);
+    return false;
+  }
+  size_t capacity = 0;
+  uint8_t *buffer = AMediaCodec_getInputBuffer(codec, static_cast<size_t>(input_index), &capacity);
+  if (buffer == nullptr || capacity == 0) {
+    LOGE("MediaCodecPlayer: getInputBuffer failed idx=%zd capacity=%zu", input_index, capacity);
+    return false;
+  }
+
+  const ssize_t sample_size = AMediaExtractor_readSampleData(extractor, buffer, capacity);
+  if (sample_size < 0) {
+    const media_status_t status = AMediaCodec_queueInputBuffer(
+        codec, static_cast<size_t>(input_index), 0, 0, 0,
+        AMEDIACODEC_BUFFER_FLAG_END_OF_STREAM);
+    if (status != AMEDIA_OK) {
+      LOGE("MediaCodecPlayer: queue input EOS failed status=%d", status);
+      return false;
+    }
+    *input_eos = true;
+    const uint64_t count = queued_input_count.fetch_add(1, std::memory_order_relaxed) + 1;
+    LOGI("MediaCodecPlayer: queued input EOS #%llu",
+         static_cast<unsigned long long>(count));
+    return true;
+  }
+  const int64_t pts_us = AMediaExtractor_getSampleTime(extractor);
+  const media_status_t status = AMediaCodec_queueInputBuffer(
+      codec, static_cast<size_t>(input_index), 0, static_cast<size_t>(sample_size),
+      pts_us >= 0 ? static_cast<uint64_t>(pts_us) : 0u, 0);
+  if (status != AMEDIA_OK) {
+    LOGE("MediaCodecPlayer: queueInputBuffer failed status=%d size=%zd pts=%lld",
+         status, sample_size, static_cast<long long>(pts_us));
+    return false;
+  }
+  const uint64_t count = queued_input_count.fetch_add(1, std::memory_order_relaxed) + 1;
+  if (count <= 5 || (count % 120) == 0) {
+    LOGI("MediaCodecPlayer: queued input #%llu idx=%zd size=%zd cap=%zu pts=%lld",
+         static_cast<unsigned long long>(count), input_index, sample_size, capacity,
+         static_cast<long long>(pts_us));
+  }
+  (void)AMediaExtractor_advance(extractor);
+  return true;
+}
+
+DecodeOutcome DecodeOnce(const Options &opt, BinderClient *binder,
+                         std::string *switch_input) {
+  AMediaExtractor *extractor = nullptr;
+  AMediaCodec *codec = nullptr;
+  int input_fd = -1;
+  TrackInfo track{};
+  OutputLayout layout{};
   SourceRing ring;
-  std::vector<uint8_t> dst_i420;
-  bool ok = false;
+  std::vector<uint8_t> i420;
+  bool ring_registered = false;
+  bool stream_logged = false;
+  bool codec_started = false;
 
   auto cleanup = [&]() {
-    if (binder != nullptr) ClearService(binder);
-    if (sws != nullptr) sws_freeContext(sws);
-    if (dst_frame != nullptr) av_frame_free(&dst_frame);
-    if (frame != nullptr) av_frame_free(&frame);
-    if (pkt != nullptr) av_packet_free(&pkt);
-    if (codec_ctx != nullptr) avcodec_free_context(&codec_ctx);
-    if (fmt != nullptr) avformat_close_input(&fmt);
+    if (codec != nullptr) {
+      if (codec_started) AMediaCodec_stop(codec);
+      AMediaCodec_delete(codec);
+    }
+    if (track.format != nullptr) AMediaFormat_delete(track.format);
+    if (extractor != nullptr) AMediaExtractor_delete(extractor);
+    if (input_fd >= 0) close(input_fd);
   };
 
-  LOGI("FFmpegPlayer: open input %s", opt.input.c_str());
-  if (avformat_open_input(&fmt, opt.input.c_str(), nullptr, nullptr) < 0) {
-    LOGE("FFmpegPlayer: avformat_open_input failed path=%s", opt.input.c_str());
+  auto ensure_ring_registered = [&]() -> bool {
+    if (layout.width <= 0 || layout.height <= 0) {
+      LOGE("MediaCodecPlayer: source ring init failed invalid layout %dx%d",
+           layout.width, layout.height);
+      return false;
+    }
+    if (ring_registered) {
+      if (layout.width != ring.width || layout.height != ring.height) {
+        LOGE("MediaCodecPlayer: output size changed after registration failed old=%dx%d new=%dx%d",
+             ring.width, ring.height, layout.width, layout.height);
+        return false;
+      }
+      return true;
+    }
+    if (!InitSourceRing(&ring, layout.width, layout.height) ||
+        !RegisterSourceRing(binder, ring)) {
+      return false;
+    }
+    ring_registered = true;
+    i420.resize(awesomecam::I420FrameSize(layout.width, layout.height));
+    if (i420.empty()) {
+      LOGE("MediaCodecPlayer: I420 allocation failed out=%dx%d", layout.width,
+           layout.height);
+      return false;
+    }
+    if (!stream_logged) {
+      LOGI("MediaCodecPlayer: stream=%zu mime=%s src=%dx%d out=%dx%d fps=%d durationUs=%lld input=%s",
+           track.index, track.mime.c_str(), track.width, track.height, layout.width,
+           layout.height, track.frame_rate, static_cast<long long>(track.duration_us),
+           opt.input.c_str());
+      stream_logged = true;
+    }
+    return true;
+  };
+
+  LOGI("MediaCodecPlayer: open input %s", opt.input.c_str());
+  if (!OpenExtractor(opt.input, &extractor, &input_fd)) {
     cleanup();
-    return false;
+    return DecodeOutcome::kFailed;
   }
-  if (avformat_find_stream_info(fmt, nullptr) < 0) {
-    LOGE("FFmpegPlayer: avformat_find_stream_info failed");
+  if (!FindVideoTrack(extractor, &track)) {
     cleanup();
-    return false;
+    return DecodeOutcome::kFailed;
   }
-  const AVCodec *decoder = nullptr;
-  const int stream_index = av_find_best_stream(fmt, AVMEDIA_TYPE_VIDEO, -1, -1,
-                                               &decoder, 0);
-  if (stream_index < 0 || decoder == nullptr) {
-    LOGE("FFmpegPlayer: no video stream found");
+  if (AMediaExtractor_selectTrack(extractor, track.index) != AMEDIA_OK) {
+    LOGE("MediaCodecPlayer: selectTrack failed index=%zu", track.index);
     cleanup();
-    return false;
-  }
-  AVStream *stream = fmt->streams[stream_index];
-  codec_ctx = avcodec_alloc_context3(decoder);
-  if (codec_ctx == nullptr || avcodec_parameters_to_context(codec_ctx, stream->codecpar) < 0 ||
-      avcodec_open2(codec_ctx, decoder, nullptr) < 0) {
-    LOGE("FFmpegPlayer: decoder open failed");
-    cleanup();
-    return false;
+    return DecodeOutcome::kFailed;
   }
 
-  int dst_w = 0;
-  int dst_h = 0;
-  ComputeOutputSize(codec_ctx->width, codec_ctx->height, opt.max_long, opt.max_short,
-                    &dst_w, &dst_h);
-  if (!InitSourceRing(&ring, dst_w, dst_h) || !RegisterSourceRing(binder, ring)) {
+  codec = AMediaCodec_createDecoderByType(track.mime.c_str());
+  if (codec == nullptr) {
+    LOGE("MediaCodecPlayer: createDecoderByType failed mime=%s", track.mime.c_str());
     cleanup();
-    return false;
+    return DecodeOutcome::kFailed;
   }
-  dst_i420.resize(awesomecam::I420FrameSize(dst_w, dst_h));
-  pkt = av_packet_alloc();
-  frame = av_frame_alloc();
-  dst_frame = av_frame_alloc();
-  if (pkt == nullptr || frame == nullptr || dst_frame == nullptr || dst_i420.empty()) {
-    LOGE("FFmpegPlayer: allocation failed");
+  const media_status_t configure_status = AMediaCodec_configure(codec, track.format,
+                                                               nullptr, nullptr, 0);
+  if (configure_status != AMEDIA_OK) {
+    LOGE("MediaCodecPlayer: configure failed status=%d mime=%s format=%s",
+         configure_status, track.mime.c_str(), AMediaFormat_toString(track.format));
     cleanup();
-    return false;
+    return DecodeOutcome::kFailed;
+  }
+  const media_status_t start_status = AMediaCodec_start(codec);
+  if (start_status != AMEDIA_OK) {
+    LOGE("MediaCodecPlayer: start failed status=%d mime=%s", start_status, track.mime.c_str());
+    cleanup();
+    return DecodeOutcome::kFailed;
+  }
+  codec_started = true;
+
+  if (AMediaFormat *initial_output_format = AMediaCodec_getOutputFormat(codec);
+      initial_output_format != nullptr) {
+    if (UpdateOutputLayout(initial_output_format, track.width, track.height, &layout, false)) {
+      if (!ensure_ring_registered()) {
+        AMediaFormat_delete(initial_output_format);
+        cleanup();
+        return DecodeOutcome::kFailed;
+      }
+    } else {
+      LOGW("MediaCodecPlayer: initial output format incomplete; waiting for codec output format");
+    }
+    AMediaFormat_delete(initial_output_format);
   }
 
-  LOGI("FFmpegPlayer: stream=%d codec=%s src=%dx%d pixFmt=%d out=%dx%d timeBase=%d/%d",
-       stream_index, decoder->name ? decoder->name : "?", codec_ctx->width, codec_ctx->height,
-       codec_ctx->pix_fmt, dst_w, dst_h, stream->time_base.num, stream->time_base.den);
-
-  uint8_t *dst_data[4] = {nullptr, nullptr, nullptr, nullptr};
-  int dst_linesize[4] = {0, 0, 0, 0};
-  av_image_fill_arrays(dst_data, dst_linesize, dst_i420.data(), AV_PIX_FMT_YUV420P,
-                       dst_w, dst_h, 1);
-
+  bool input_eos = false;
+  bool output_eos = false;
   bool clock_started = false;
   int64_t base_wall_us = 0;
   int64_t base_pts_us = 0;
   uint64_t decoded = 0;
   int64_t fps_window_us = MonotonicUs();
+  int64_t variant_probe_us = fps_window_us;
   uint64_t fps_frames = 0;
 
-  while (!g_stop.load(std::memory_order_acquire)) {
-    const int read_rc = av_read_frame(fmt, pkt);
-    if (read_rc < 0) {
-      avcodec_send_packet(codec_ctx, nullptr);
-    } else if (pkt->stream_index == stream_index) {
-      if (avcodec_send_packet(codec_ctx, pkt) < 0) {
-        av_packet_unref(pkt);
-        continue;
+  while (!g_stop.load(std::memory_order_acquire) && !output_eos) {
+    const int64_t probe_now_us = MonotonicUs();
+    if (opt.auto_variant && probe_now_us - variant_probe_us >= 1000000LL) {
+      variant_probe_us = probe_now_us;
+      const std::string wanted = ResolveAutoVariantInput(binder, opt.input, "poll");
+      if (!wanted.empty() && wanted != opt.input && IsReadableRegularFile(wanted)) {
+        if (switch_input != nullptr) *switch_input = wanted;
+        LOGI("MediaCodecPlayer: switching input current=%s next=%s",
+             opt.input.c_str(), wanted.c_str());
+        cleanup();
+        return DecodeOutcome::kSwitchInput;
       }
     }
-    av_packet_unref(pkt);
 
-    while (!g_stop.load(std::memory_order_acquire)) {
-      const int rc = avcodec_receive_frame(codec_ctx, frame);
-      if (rc == AVERROR(EAGAIN) || rc == AVERROR_EOF) break;
-      if (rc < 0) {
-        LOGW("FFmpegPlayer: avcodec_receive_frame rc=%d", rc);
-        break;
-      }
+    if (!QueueExtractorInput(codec, extractor, &input_eos)) {
+      cleanup();
+      return DecodeOutcome::kFailed;
+    }
 
-      sws = sws_getCachedContext(sws, frame->width, frame->height,
-                                 static_cast<AVPixelFormat>(frame->format), dst_w, dst_h,
-                                 AV_PIX_FMT_YUV420P, SWS_FAST_BILINEAR,
-                                 nullptr, nullptr, nullptr);
-      if (sws == nullptr) {
-        LOGE("FFmpegPlayer: sws_getCachedContext failed");
-        av_frame_unref(frame);
-        continue;
+    AMediaCodecBufferInfo info{};
+    const ssize_t output_index = AMediaCodec_dequeueOutputBuffer(codec, &info, kCodecIoTimeoutUs);
+    if (output_index == AMEDIACODEC_INFO_TRY_AGAIN_LATER) {
+      continue;
+    }
+    if (output_index == AMEDIACODEC_INFO_OUTPUT_BUFFERS_CHANGED) {
+      continue;
+    }
+    if (output_index == AMEDIACODEC_INFO_OUTPUT_FORMAT_CHANGED) {
+      AMediaFormat *new_format = AMediaCodec_getOutputFormat(codec);
+      if (new_format == nullptr || !UpdateOutputLayout(new_format, track.width, track.height,
+                                                       &layout)) {
+        if (new_format != nullptr) AMediaFormat_delete(new_format);
+        cleanup();
+        return DecodeOutcome::kFailed;
       }
-      const int scaled = sws_scale(sws, frame->data, frame->linesize, 0, frame->height,
-                                   dst_data, dst_linesize);
-      if (scaled != dst_h) {
-        LOGW("FFmpegPlayer: sws_scale returned %d expected %d", scaled, dst_h);
-        av_frame_unref(frame);
-        continue;
+      AMediaFormat_delete(new_format);
+      if (!ensure_ring_registered()) {
+        cleanup();
+        return DecodeOutcome::kFailed;
       }
-      const int64_t pts_us = FramePtsUs(frame, stream->time_base);
+      continue;
+    }
+    if (output_index < 0) {
+      LOGE("MediaCodecPlayer: dequeueOutputBuffer failed rc=%zd", output_index);
+      cleanup();
+      return DecodeOutcome::kFailed;
+    }
+
+    if ((info.flags & AMEDIACODEC_BUFFER_FLAG_END_OF_STREAM) != 0) {
+      output_eos = true;
+    }
+
+    if (info.size > 0 && (info.flags & AMEDIACODEC_BUFFER_FLAG_CODEC_CONFIG) == 0) {
+      if (!ring_registered) {
+        AMediaFormat *buffer_format =
+            AMediaCodec_getBufferFormat(codec, static_cast<size_t>(output_index));
+        if (buffer_format == nullptr ||
+            !UpdateOutputLayout(buffer_format, track.width, track.height, &layout)) {
+          if (buffer_format != nullptr) AMediaFormat_delete(buffer_format);
+          LOGE("MediaCodecPlayer: output buffer format unavailable before first frame failed");
+          AMediaCodec_releaseOutputBuffer(codec, static_cast<size_t>(output_index), false);
+          cleanup();
+          return DecodeOutcome::kFailed;
+        }
+        AMediaFormat_delete(buffer_format);
+        if (!ensure_ring_registered()) {
+          AMediaCodec_releaseOutputBuffer(codec, static_cast<size_t>(output_index), false);
+          cleanup();
+          return DecodeOutcome::kFailed;
+        }
+      }
+      size_t output_size = 0;
+      uint8_t *output = AMediaCodec_getOutputBuffer(codec, static_cast<size_t>(output_index),
+                                                    &output_size);
+      if (output == nullptr || static_cast<size_t>(info.offset) > output_size ||
+          static_cast<size_t>(info.size) > output_size - static_cast<size_t>(info.offset)) {
+        LOGE("MediaCodecPlayer: getOutputBuffer failed idx=%zd offset=%d size=%d cap=%zu",
+             output_index, info.offset, info.size, output_size);
+        AMediaCodec_releaseOutputBuffer(codec, static_cast<size_t>(output_index), false);
+        cleanup();
+        return DecodeOutcome::kFailed;
+      }
+      const uint8_t *frame_ptr = output + info.offset;
+      const size_t frame_size = static_cast<size_t>(info.size);
+      if (!ConvertOutputToI420(frame_ptr, frame_size, layout, &i420)) {
+        LOGE("MediaCodecPlayer: output conversion failed layout=%s color=%#x out=%dx%d stride=%d slice=%d size=%zu",
+             LayoutKindName(layout.kind), layout.color_format, layout.width, layout.height,
+             layout.stride, layout.slice_height, frame_size);
+        AMediaCodec_releaseOutputBuffer(codec, static_cast<size_t>(output_index), false);
+        cleanup();
+        return DecodeOutcome::kFailed;
+      }
+      const int64_t pts_us = info.presentationTimeUs;
       PaceFrame(pts_us, &clock_started, &base_wall_us, &base_pts_us);
-      if (!WriteFrame(&ring, dst_i420.data(), dst_i420.size(), pts_us)) {
-        LOGE("FFmpegPlayer: WriteFrame failed");
+      if (!WriteFrame(&ring, i420.data(), i420.size(), pts_us)) {
+        LOGE("MediaCodecPlayer: WriteFrame failed");
       }
       decoded += 1;
       fps_frames += 1;
       if (decoded <= 5 || (decoded % 120) == 0) {
-        LOGI("FFmpegPlayer: wrote source frame #%llu gen=%llu slot=%u out=%dx%d pts=%lld",
+        LOGI("MediaCodecPlayer: wrote source frame #%llu gen=%llu slot=%u out=%dx%d pts=%lld",
              static_cast<unsigned long long>(decoded),
              static_cast<unsigned long long>(ring.next_generation),
              (ring.next_slot + awesomecam::kSharedMemoryRingSlotCount - 1) %
                  awesomecam::kSharedMemoryRingSlotCount,
-             dst_w, dst_h, static_cast<long long>(pts_us));
+             layout.width, layout.height, static_cast<long long>(pts_us));
       }
       const int64_t now_us = MonotonicUs();
       if (now_us - fps_window_us >= 2000000LL) {
         const double fps = static_cast<double>(fps_frames) * 1000000.0 /
                            static_cast<double>(now_us - fps_window_us);
-        LOGI("FFmpegPlayer: decoded FPS fps=%.1f frames=%llu latestGen=%llu",
+        LOGI("MediaCodecPlayer: decoded FPS fps=%.1f frames=%llu latestGen=%llu input=%s",
              fps, static_cast<unsigned long long>(fps_frames),
-             static_cast<unsigned long long>(ring.next_generation));
+             static_cast<unsigned long long>(ring.next_generation),
+             opt.input.c_str());
         fps_window_us = now_us;
         fps_frames = 0;
       }
-      av_frame_unref(frame);
     }
-    if (read_rc < 0) {
-      ok = true;
-      break;
-    }
+
+    AMediaCodec_releaseOutputBuffer(codec, static_cast<size_t>(output_index), false);
   }
 
+  if (ring_registered) {
+    LOGI("MediaCodecPlayer: decode pass complete frames=%llu eos=%d stop=%d",
+         static_cast<unsigned long long>(decoded), output_eos ? 1 : 0,
+         g_stop.load(std::memory_order_acquire) ? 1 : 0);
+  }
   cleanup();
-  return ok;
+  return g_stop.load(std::memory_order_acquire) ? DecodeOutcome::kStopped
+                                                : DecodeOutcome::kEof;
 }
 
 }  // namespace
@@ -492,7 +1175,6 @@ bool DecodeOnce(const Options &opt, BinderClient *binder) {
 int main(int argc, char **argv) {
   signal(SIGTERM, SignalHandler);
   signal(SIGINT, SignalHandler);
-  av_log_set_level(AV_LOG_ERROR);
 
   Options opt = ParseOptions(argc, argv);
   WritePidFile(opt.pidfile);
@@ -504,20 +1186,41 @@ int main(int argc, char **argv) {
   }
 
   uint64_t loops = 0;
+  int exit_code = 0;
+  std::string current_input = opt.auto_variant
+                                  ? ResolveAutoVariantInput(&binder, opt.input, "start")
+                                  : opt.input;
+  LOGI("MediaCodecPlayer: initial input=%s autoVariant=%d default=%s",
+       current_input.c_str(), opt.auto_variant ? 1 : 0, opt.input.c_str());
   do {
     loops += 1;
-    const bool ok = DecodeOnce(opt, &binder);
-    if (!ok && !g_stop.load(std::memory_order_acquire)) {
-      LOGW("FFmpegPlayer: decode loop failed; retry in 500ms");
-      std::this_thread::sleep_for(std::chrono::milliseconds(500));
-    } else if (opt.loop && !g_stop.load(std::memory_order_acquire)) {
-      LOGI("FFmpegPlayer: loop EOF reached, restarting input loops=%llu",
+    Options pass = opt;
+    pass.input = current_input;
+    std::string switch_input;
+    const DecodeOutcome outcome = DecodeOnce(pass, &binder, &switch_input);
+    if (outcome == DecodeOutcome::kSwitchInput && !switch_input.empty() &&
+        !g_stop.load(std::memory_order_acquire)) {
+      current_input = switch_input;
+      LOGI("MediaCodecPlayer: restarting for target variant input=%s",
+           current_input.c_str());
+      continue;
+    }
+    if (outcome == DecodeOutcome::kFailed && !g_stop.load(std::memory_order_acquire)) {
+      LOGE("MediaCodecPlayer: decode failed input=%s", current_input.c_str());
+      exit_code = 3;
+      break;
+    }
+    if (opt.loop && !g_stop.load(std::memory_order_acquire)) {
+      if (opt.auto_variant) {
+        current_input = ResolveAutoVariantInput(&binder, opt.input, "loop");
+      }
+      LOGI("MediaCodecPlayer: loop EOF reached, restarting input loops=%llu",
            static_cast<unsigned long long>(loops));
     }
   } while (opt.loop && !g_stop.load(std::memory_order_acquire));
 
   ClearService(&binder);
   if (!opt.pidfile.empty()) unlink(opt.pidfile.c_str());
-  LOGI("FFmpegPlayer: exit");
-  return 0;
+  LOGI("MediaCodecPlayer: exit code=%d", exit_code);
+  return exit_code;
 }

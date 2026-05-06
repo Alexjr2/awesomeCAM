@@ -64,7 +64,8 @@ class InjectorActivity : AppCompatActivity() {
             "Build: $buildIdentity\n\nRequired assets: $HELPER_ASSET, $PLAYER_ASSET, $SHADOWHOOK_LIB_NAME, $HOOK_ASSET\n" +
                 "Stage 1: $RUNTIME_DIR/$SHADOWHOOK_LIB_NAME\n" +
                 "Stage 2: $RUNTIME_DIR/$HOOK_ASSET (call main_hook)\n" +
-                "Player: $RUNTIME_DIR/$PLAYER_ASSET + FFmpeg libs\n\n" +
+                "Player: $RUNTIME_DIR/$PLAYER_ASSET (MediaCodec) + FFmpeg prescale tool\n\n" +
+                "Default playback variant: ${Mp4FeedController.DEFAULT_VIDEO_PATH}\n" +
                 "Video source: ${selectedVideoDisplayName()}",
         )
 
@@ -73,10 +74,7 @@ class InjectorActivity : AppCompatActivity() {
                 appendStatus("Preparing runtime files")
                 val localHelper = extractAsset(HELPER_ASSET)
                 val localPlayer = extractAsset(PLAYER_ASSET)
-                val localFfmpegLibs = FFMPEG_LIB_NAMES.mapNotNull { extractOptionalBundledNativeLib(it) }
-                require(localFfmpegLibs.any { it.name == "libffmpeg.so" }) {
-                    "Missing bundled FFmpeg libffmpeg.so in APK"
-                }
+                val localFfmpegLibs = extractBundledFfmpegRuntime()
                 // libhook.so must come from APK native lib/.
                 // AGP packages assets before CMake refreshes app/src/main/assets/libhook.so,
                 // so assets/libhook.so can be one build stale and crash cameraserver.
@@ -195,8 +193,9 @@ class InjectorActivity : AppCompatActivity() {
                     runOnUiThread { updateFeedButton() }
                 }
 
-                appendStatus("Video source: staging \"$displayName\" for native playback")
-                val output = runRoot(buildStageVideoCommands(stagedCopy))
+                appendStatus("Video source: staging \"$displayName\" and prescaling variants")
+                val localFfmpegLibs = extractBundledFfmpegRuntime()
+                val output = runRoot(buildFfmpegRuntimeCommands(localFfmpegLibs) + buildStageVideoCommands(stagedCopy))
                 persistSelectedVideoDisplayName(displayName)
                 appendStatus("Video source: \"$displayName\" is ready\n$output")
                 runOnUiThread {
@@ -325,6 +324,38 @@ class InjectorActivity : AppCompatActivity() {
         return outFile
     }
 
+    private fun extractBundledFfmpegRuntime(): List<File> {
+        val localFfmpegLibs = FFMPEG_LIB_NAMES.mapNotNull { extractOptionalBundledNativeLib(it) }
+        require(localFfmpegLibs.any { it.name == "libffmpeg.so" }) {
+            "Missing bundled FFmpeg libffmpeg.so in APK"
+        }
+        require(localFfmpegLibs.any { it.name == FFMPEG_EXE_LIB_NAME }) {
+            "Missing bundled FFmpeg executable $FFMPEG_EXE_LIB_NAME in APK"
+        }
+        return localFfmpegLibs
+    }
+
+    private fun buildFfmpegRuntimeCommands(ffmpegLibs: List<File>): List<String> {
+        val ffmpegExeSrc = ffmpegLibs.firstOrNull { it.name == FFMPEG_EXE_LIB_NAME }
+            ?: error("Missing local FFmpeg executable $FFMPEG_EXE_LIB_NAME")
+        val ffmpegExeDst = "$RUNTIME_DIR/$FFMPEG_BIN_NAME"
+        return buildList {
+            add("mkdir -p ${shellQuote(RUNTIME_DIR)}")
+            for (lib in ffmpegLibs) {
+                add("cp ${shellQuote(lib.absolutePath)} ${shellQuote("$RUNTIME_DIR/${lib.name}")}")
+            }
+            add("cp ${shellQuote(ffmpegExeSrc.absolutePath)} ${shellQuote(ffmpegExeDst)}")
+            add("chmod 0755 ${shellQuote(ffmpegExeDst)}")
+            for (lib in ffmpegLibs) {
+                add("chmod 0644 ${shellQuote("$RUNTIME_DIR/${lib.name}")}")
+            }
+            add("chcon u:object_r:system_lib_file:s0 ${shellQuote(ffmpegExeDst)}")
+            for (lib in ffmpegLibs) {
+                add("chcon u:object_r:system_lib_file:s0 ${shellQuote("$RUNTIME_DIR/${lib.name}")}")
+            }
+        }
+    }
+
     private fun buildRuntimeCommands(
         helper: File,
         player: File,
@@ -334,6 +365,7 @@ class InjectorActivity : AppCompatActivity() {
     ): List<String> {
         val helperDst = "$RUNTIME_DIR/$HELPER_ASSET"
         val playerDst = "$RUNTIME_DIR/$PLAYER_ASSET"
+        val ffmpegExeDst = "$RUNTIME_DIR/$FFMPEG_BIN_NAME"
         val shadowHookDst = "$RUNTIME_DIR/$SHADOWHOOK_LIB_NAME"
         val hookDst = "$RUNTIME_DIR/$HOOK_ASSET"
 
@@ -341,20 +373,12 @@ class InjectorActivity : AppCompatActivity() {
             add("mkdir -p ${shellQuote(RUNTIME_DIR)}")
             add("cp ${shellQuote(helper.absolutePath)} ${shellQuote(helperDst)}")
             add("cp ${shellQuote(player.absolutePath)} ${shellQuote(playerDst)}")
-            for (lib in ffmpegLibs) {
-                add("cp ${shellQuote(lib.absolutePath)} ${shellQuote("$RUNTIME_DIR/${lib.name}")}")
-            }
+            addAll(buildFfmpegRuntimeCommands(ffmpegLibs))
             add("cp ${shellQuote(shadowHook.absolutePath)} ${shellQuote(shadowHookDst)}")
             add("cp ${shellQuote(hook.absolutePath)} ${shellQuote(hookDst)}")
-            add("chmod 0755 ${shellQuote(helperDst)} ${shellQuote(playerDst)}")
+            add("chmod 0755 ${shellQuote(helperDst)} ${shellQuote(playerDst)} ${shellQuote(ffmpegExeDst)}")
             add("chmod 0644 ${shellQuote(shadowHookDst)} ${shellQuote(hookDst)}")
-            for (lib in ffmpegLibs) {
-                add("chmod 0644 ${shellQuote("$RUNTIME_DIR/${lib.name}")}")
-            }
-            add("chcon u:object_r:system_lib_file:s0 ${shellQuote(playerDst)} ${shellQuote(shadowHookDst)} ${shellQuote(hookDst)}")
-            for (lib in ffmpegLibs) {
-                add("chcon u:object_r:system_lib_file:s0 ${shellQuote("$RUNTIME_DIR/${lib.name}")}")
-            }
+            add("chcon u:object_r:system_lib_file:s0 ${shellQuote(playerDst)} ${shellQuote(ffmpegExeDst)} ${shellQuote(shadowHookDst)} ${shellQuote(hookDst)}")
             // Do not wrap with `sh -c`.
             //
             // KernelSU keeps the top-level `su` command in u:r:su:s0, but a nested
@@ -370,18 +394,76 @@ class InjectorActivity : AppCompatActivity() {
 
     private fun buildStageVideoCommands(source: File): List<String> {
         val tmpDst = "$RUNTIME_DIR/.input.mp4.tmp"
-        val finalDst = Mp4FeedController.DEFAULT_VIDEO_PATH
-        return listOf(
-            "mkdir -p ${shellQuote(RUNTIME_DIR)}",
-            "rm -f ${shellQuote(tmpDst)}",
-            "cp ${shellQuote(source.absolutePath)} ${shellQuote(tmpDst)}",
-            "chmod 0644 ${shellQuote(tmpDst)}",
-            "chcon u:object_r:awesomecam_source_file:s0 ${shellQuote(tmpDst)} 2>/dev/null || true",
-            "mv -f ${shellQuote(tmpDst)} ${shellQuote(finalDst)}",
-            "chmod 0644 ${shellQuote(finalDst)}",
-            "chcon u:object_r:awesomecam_source_file:s0 ${shellQuote(finalDst)} 2>/dev/null || true",
-            "echo 'STAGED selected video for native playback'",
-        )
+        val finalDst = Mp4FeedController.STAGED_INPUT_PATH
+        return buildList {
+            add("mkdir -p ${shellQuote(RUNTIME_DIR)}")
+            add("rm -f ${shellQuote(tmpDst)}")
+            add("cp ${shellQuote(source.absolutePath)} ${shellQuote(tmpDst)}")
+            add("chmod 0644 ${shellQuote(tmpDst)}")
+            add("chcon u:object_r:awesomecam_source_file:s0 ${shellQuote(tmpDst)} 2>/dev/null || true")
+            add("mv -f ${shellQuote(tmpDst)} ${shellQuote(finalDst)}")
+            add("chmod 0644 ${shellQuote(finalDst)}")
+            add("chcon u:object_r:awesomecam_source_file:s0 ${shellQuote(finalDst)} 2>/dev/null || true")
+            add(buildPrescaleVariantCommand(finalDst))
+            add("echo 'STAGED selected video and prescaled variants for MediaCodec playback'")
+        }
+    }
+
+    private fun buildPrescaleVariantCommand(inputPath: String): String {
+        val variants = listOf("1440 1080", "1280 720", "1920 1080", "640 480")
+        val calls = variants.joinToString("\n") { dims ->
+            val parts = dims.split(' ')
+            "make_variant ${parts[0]} ${parts[1]} || exit 1"
+        }
+        return """
+            export LD_LIBRARY_PATH=${shellQuote(RUNTIME_DIR)}:${'$'}{LD_LIBRARY_PATH}
+            FFMPEG=${shellQuote("$RUNTIME_DIR/$FFMPEG_BIN_NAME")}
+            SRC=${shellQuote(inputPath)}
+            if [ ! -x "${'$'}FFMPEG" ]; then
+              echo "ERROR: missing executable ${'$'}FFMPEG; inject/stage runtime first"
+              exit 1
+            fi
+            if [ ! -r "${'$'}SRC" ]; then
+              echo "ERROR: missing staged input ${'$'}SRC"
+              exit 1
+            fi
+            ENCODE_TIMEOUT=8
+            rm -f ${shellQuote("$RUNTIME_DIR/input_1440x1080.mp4")} ${shellQuote("$RUNTIME_DIR/input_1280x720.mp4")} ${shellQuote("$RUNTIME_DIR/input_1920x1080.mp4")} ${shellQuote("$RUNTIME_DIR/input_640x480.mp4")}
+            make_variant() {
+              W="${'$'}1"
+              H="${'$'}2"
+              OUT="$RUNTIME_DIR/input_${'$'}{W}x${'$'}{H}.mp4"
+              TMP="$RUNTIME_DIR/.input_${'$'}{W}x${'$'}{H}.mp4.tmp"
+              FILTER="scale=${'$'}{W}:${'$'}{H}:force_original_aspect_ratio=increase,crop=${'$'}{W}:${'$'}{H},setsar=1"
+              rm -f "${'$'}TMP" "${'$'}OUT"
+              for ENC in h264_mediacodec libx264 mpeg4; do
+                LOG="$RUNTIME_DIR/ffmpeg_prescale_${'$'}{W}x${'$'}{H}_${'$'}{ENC}.log"
+                rm -f "${'$'}TMP"
+                echo "PRESCALE ${'$'}{W}x${'$'}{H}: trying encoder=${'$'}ENC"
+                if [ "${'$'}ENC" = "h264_mediacodec" ]; then
+                  timeout "${'$'}ENCODE_TIMEOUT" "${'$'}FFMPEG" -hide_banner -nostdin -y -i "${'$'}SRC" -vf "${'$'}FILTER" -an -r 30 -c:v h264_mediacodec -b:v 8000000 -movflags +faststart -f mp4 "${'$'}TMP" > "${'$'}LOG" 2>&1
+                elif [ "${'$'}ENC" = "libx264" ]; then
+                  timeout "${'$'}ENCODE_TIMEOUT" "${'$'}FFMPEG" -hide_banner -nostdin -y -i "${'$'}SRC" -vf "${'$'}FILTER" -an -r 30 -c:v libx264 -pix_fmt yuv420p -movflags +faststart -f mp4 "${'$'}TMP" > "${'$'}LOG" 2>&1
+                else
+                  timeout "${'$'}ENCODE_TIMEOUT" "${'$'}FFMPEG" -hide_banner -nostdin -y -i "${'$'}SRC" -vf "${'$'}FILTER" -an -r 30 -c:v mpeg4 -q:v 4 -pix_fmt yuv420p -movflags +faststart -f mp4 "${'$'}TMP" > "${'$'}LOG" 2>&1
+                fi
+                RC="${'$'}?"
+                if [ "${'$'}RC" -eq 0 ] && [ -s "${'$'}TMP" ]; then
+                  mv -f "${'$'}TMP" "${'$'}OUT"
+                  chmod 0644 "${'$'}OUT"
+                  chcon u:object_r:awesomecam_source_file:s0 "${'$'}OUT" 2>/dev/null || true
+                  echo "PRESCALED ${'$'}{W}x${'$'}{H}: encoder=${'$'}ENC out=${'$'}OUT"
+                  return 0
+                fi
+                echo "PRESCALE ${'$'}{W}x${'$'}{H}: encoder=${'$'}ENC failed rc=${'$'}RC"
+                tail -n 8 "${'$'}LOG" 2>/dev/null || true
+              done
+              rm -f "${'$'}TMP"
+              echo "ERROR: failed to prescale ${'$'}{W}x${'$'}{H}"
+              return 1
+            }
+            $calls
+        """.trimIndent()
     }
 
     private fun runRoot(commands: List<String>): String {
@@ -419,6 +501,8 @@ class InjectorActivity : AppCompatActivity() {
         private const val PLAYER_ASSET = "awesomecam_player"
         private const val HOOK_ASSET = "libhook.so"
         private const val SHADOWHOOK_LIB_NAME = "libshadowhook.so"
+        private const val FFMPEG_BIN_NAME = "ffmpeg"
+        private const val FFMPEG_EXE_LIB_NAME = "libffmpegexe.so"
         private const val PREFS_NAME = "video_source"
         private const val PREF_SELECTED_VIDEO_NAME = "selected_video_display_name"
         private val FFMPEG_LIB_NAMES = listOf(

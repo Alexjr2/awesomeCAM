@@ -21,6 +21,7 @@ using FnSwsFreeContext = void (*)(SwsContext *);
 
 #include "video2camera_ipc.h"
 #include "video2camera_service.h"
+#include "libyuv_runtime.h"
 
 #define LOG_TAG "awesomeCAM"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
@@ -179,6 +180,15 @@ bool build_ready_scaled_i420(int src_width, int src_height, const uint8_t *src_i
   const int src_linesize[4] = {src_width, src_cw, src_cw, 0};
   uint8_t *dst_data[4] = {dst_y, dst_u, dst_v, nullptr};
   const int dst_linesize[4] = {dst_width, dst_cw, dst_cw, 0};
+
+  // Prefer libyuv's I420 scaler.  It is much faster than swscale for large
+  // preview targets such as 3280x2464 and keeps the cameraserver write path
+  // smooth even when the player decodes a smaller prescaled source.
+  if (LibYuvI420Scale(src_y, src_width, src_u, src_cw, src_v, src_cw,
+                      crop_w, crop_h, dst_y, dst_width, dst_u, dst_cw, dst_v,
+                      dst_cw, dst_width, dst_height, 0)) {
+    return true;
+  }
 
   if (!LoadSwsApi()) return false;
   SwsContext *ctx = g_sws_api.get_context(crop_w, crop_h, kAvPixFmtYuv420p,

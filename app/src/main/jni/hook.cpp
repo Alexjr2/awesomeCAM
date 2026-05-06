@@ -891,7 +891,7 @@ bool try_replace_camera3_frame(
         g_replaced_frame_count.fetch_add(1, std::memory_order_relaxed) + 1;
     if (replace_count <= 10 || (replace_count % 120) == 0) {
       const uint64_t total_done_ns = monotonic_time_ns();
-      LOGI("Replaced frame #%llu streamId=%d dst=%ux%u fmt=%#x source=FFmpegPlayback gen=%llu pts=%lld surfaceId=%d",
+      LOGI("Replaced frame #%llu streamId=%d dst=%ux%u fmt=%#x source=MediaCodecPlayback gen=%llu pts=%lld surfaceId=%d",
            static_cast<unsigned long long>(replace_count),
            matched_stream != nullptr ? matched_stream->stream_id : -1,
            buffer.stream->width, buffer.stream->height, buffer.stream->format,
@@ -968,7 +968,7 @@ bool try_replace_anw_buffer_direct(void *anw_buffer, int width, int height, int 
   if (replaced) {
     const uint64_t c = g_queue_replaced_frame_count.fetch_add(1, std::memory_order_relaxed) + 1;
     if (c <= 20 || (c % 120) == 0) {
-      LOGI("%s replaced queue frame #%llu dst=%dx%d fmt=%#x source=FFmpegPlayback gen=%llu pts=%lld",
+      LOGI("%s replaced queue frame #%llu dst=%dx%d fmt=%#x source=MediaCodecPlayback gen=%llu pts=%lld",
            where, static_cast<unsigned long long>(c), width, height, format,
            static_cast<unsigned long long>(frame->generation),
            static_cast<long long>(frame->pts_us));
