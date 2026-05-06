@@ -18,6 +18,7 @@
 #include <atomic>
 #include <chrono>
 #include <cinttypes>
+#include <cmath>
 #include <string>
 #include <thread>
 #include <vector>
@@ -276,6 +277,43 @@ const VariantSpec *FindVariantBySize(int32_t width, int32_t height) {
   return nullptr;
 }
 
+double NormalizedAspect(int32_t width, int32_t height) {
+  const int32_t a = std::max<int32_t>(1, std::min(width, height));
+  const int32_t b = std::max<int32_t>(1, std::max(width, height));
+  return static_cast<double>(a) / static_cast<double>(b);
+}
+
+double VariantDistanceScore(const VariantSpec &variant, int32_t target_w,
+                            int32_t target_h) {
+  const double aspect_delta =
+      std::abs(NormalizedAspect(variant.width, variant.height) -
+               NormalizedAspect(target_w, target_h));
+  const double target_area =
+      static_cast<double>(std::max<int32_t>(1, target_w)) *
+      static_cast<double>(std::max<int32_t>(1, target_h));
+  const double variant_area =
+      static_cast<double>(variant.width) * static_cast<double>(variant.height);
+  const double area_ratio =
+      std::abs(std::log(std::max(variant_area, 1.0) / std::max(target_area, 1.0)));
+  return aspect_delta * 8.0 + area_ratio;
+}
+
+const VariantSpec *FindNearestReadableVariant(int32_t width, int32_t height,
+                                              double *out_score) {
+  const VariantSpec *best = nullptr;
+  double best_score = 1.0e30;
+  for (const VariantSpec &variant : kVariantSpecs) {
+    if (!IsReadableRegularFile(variant.path)) continue;
+    const double score = VariantDistanceScore(variant, width, height);
+    if (best == nullptr || score < best_score) {
+      best = &variant;
+      best_score = score;
+    }
+  }
+  if (out_score != nullptr) *out_score = best_score;
+  return best;
+}
+
 std::string ReadVariantOverride() {
   int fd = open("/data/camera/awesomecam_variant", O_RDONLY | O_CLOEXEC);
   if (fd < 0) return "";
@@ -354,8 +392,12 @@ std::string ResolveAutoVariantInput(BinderClient *client, const std::string &fal
   std::vector<TargetSnapshot> targets;
   if (QueryTargets(client, &targets)) {
     static std::string last_unmatched_target;
+    static std::string last_nearest_target;
     static std::string last_stale_target;
     const int64_t now_ns = MonotonicUs() * 1000LL;
+    const VariantSpec *nearest_variant = nullptr;
+    TargetSnapshot nearest_target{};
+    double nearest_score = 1.0e30;
     for (const TargetSnapshot &target : targets) {
       const int64_t age_ns = target.last_seen_ns > 0 ? now_ns - target.last_seen_ns : 0;
       if (target.last_seen_ns > 0 && age_ns > kFreshTargetNs) {
@@ -374,9 +416,17 @@ std::string ResolveAutoVariantInput(BinderClient *client, const std::string &fal
         char key[64];
         snprintf(key, sizeof(key), "%dx%d", target.width, target.height);
         if (last_unmatched_target != key) {
-          LOGI("MediaCodecPlayer: target %s has no exact mp4 variant; using ReadyFrameCache scaler from %s",
-               key, fallback.c_str());
+          LOGI("MediaCodecPlayer: target %s has no exact mp4 variant; searching nearest prescaled input",
+               key);
           last_unmatched_target = key;
+        }
+        double score = 0.0;
+        const VariantSpec *near = FindNearestReadableVariant(target.width, target.height,
+                                                             &score);
+        if (near != nullptr && score < nearest_score) {
+          nearest_variant = near;
+          nearest_target = target;
+          nearest_score = score;
         }
         continue;
       }
@@ -392,6 +442,20 @@ std::string ResolveAutoVariantInput(BinderClient *client, const std::string &fal
              reason != nullptr ? reason : "auto");
       }
       return variant->path;
+    }
+    if (nearest_variant != nullptr) {
+      char key[128];
+      snprintf(key, sizeof(key), "%dx%d->%s score=%.3f", nearest_target.width,
+               nearest_target.height, nearest_variant->name, nearest_score);
+      if (last_nearest_target != key || fallback != nearest_variant->path) {
+        LOGI("MediaCodecPlayer: selected nearest target variant %s path=%s for target=%dx%d hits=%llu score=%.3f reason=%s; ReadyFrameCache scales final output",
+             nearest_variant->name, nearest_variant->path, nearest_target.width,
+             nearest_target.height,
+             static_cast<unsigned long long>(nearest_target.hit_count), nearest_score,
+             reason != nullptr ? reason : "auto");
+        last_nearest_target = key;
+      }
+      return nearest_variant->path;
     }
     static bool logged_no_active_fresh = false;
     if (!logged_no_active_fresh && targets.empty()) {
