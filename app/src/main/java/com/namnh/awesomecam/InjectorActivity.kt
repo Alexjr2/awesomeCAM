@@ -62,6 +62,7 @@ class InjectorActivity : AppCompatActivity() {
 
         TelemetryStore.setInitialStatusIfEmpty(
             "Build: $buildIdentity\n\nRequired assets: $HELPER_ASSET, $PLAYER_ASSET, $SHADOWHOOK_LIB_NAME, $HOOK_ASSET\n" +
+                "SELinux: runtime ksud policy apply; no sepolicy patcher module required\n" +
                 "Stage 1: $RUNTIME_DIR/$SHADOWHOOK_LIB_NAME\n" +
                 "Stage 2: $RUNTIME_DIR/$HOOK_ASSET (call main_hook)\n" +
                 "Player: $RUNTIME_DIR/$PLAYER_ASSET (MediaCodec) + FFmpeg prescale tool\n\n" +
@@ -195,7 +196,11 @@ class InjectorActivity : AppCompatActivity() {
 
                 appendStatus("Video source: staging \"$displayName\" and normalizing 30fps variants")
                 val localFfmpegLibs = extractBundledFfmpegRuntime()
-                val output = runRoot(buildFfmpegRuntimeCommands(localFfmpegLibs) + buildStageVideoCommands(stagedCopy))
+                val output = runRootChecked(
+                    buildRuntimeSePolicyCommands() +
+                        buildFfmpegRuntimeCommands(localFfmpegLibs) +
+                        buildStageVideoCommands(stagedCopy),
+                )
                 persistSelectedVideoDisplayName(displayName)
                 appendStatus("Video source: \"$displayName\" is ready\n$output")
                 runOnUiThread {
@@ -335,6 +340,83 @@ class InjectorActivity : AppCompatActivity() {
         return localFfmpegLibs
     }
 
+    private fun buildRuntimeSePolicyCommands(): List<String> {
+        return listOf(
+            "mkdir -p ${shellQuote(RUNTIME_DIR)}",
+            """
+            |cat > ${shellQuote(RUNTIME_SEPOLICY_FILE)} <<'AWESOMECAM_SEPOLICY'
+            |$RUNTIME_SEPOLICY_RULES
+            |AWESOMECAM_SEPOLICY
+            |chmod 0644 ${shellQuote(RUNTIME_SEPOLICY_FILE)} 2>/dev/null || true
+            |chcon u:object_r:system_data_file:s0 ${shellQuote(RUNTIME_SEPOLICY_FILE)} 2>/dev/null || true
+            """.trimMargin(),
+            """
+            ensure_awesomecam_sepolicy() {
+              POLICY=${shellQuote(RUNTIME_SEPOLICY_FILE)}
+              LOG=${shellQuote("$RUNTIME_DIR/ksud_sepolicy_apply.log")}
+              rm -f "${'$'}LOG" 2>/dev/null || true
+
+              run_ksud_policy() {
+                KSUD_BIN="${'$'}1"
+                if [ -z "${'$'}KSUD_BIN" ]; then
+                  return 1
+                fi
+                echo "SELINUX_RUNTIME: checking policy with ${'$'}KSUD_BIN"
+                if ! "${'$'}KSUD_BIN" sepolicy check "${'$'}POLICY" > "${'$'}LOG" 2>&1; then
+                  echo "SELINUX_RUNTIME: ksud check failed for ${'$'}KSUD_BIN"
+                  tail -n 8 "${'$'}LOG" 2>/dev/null || true
+                  return 1
+                fi
+                echo "SELINUX_RUNTIME: applying policy with ${'$'}KSUD_BIN"
+                if ! "${'$'}KSUD_BIN" sepolicy apply "${'$'}POLICY" > "${'$'}LOG" 2>&1; then
+                  echo "SELINUX_RUNTIME: ksud apply failed for ${'$'}KSUD_BIN"
+                  tail -n 8 "${'$'}LOG" 2>/dev/null || true
+                  return 1
+                fi
+                echo "SELINUX_RUNTIME: applied via ${'$'}KSUD_BIN"
+                return 0
+              }
+
+              KSUD_IN_PATH="$(command -v ksud 2>/dev/null || true)"
+              if run_ksud_policy "${'$'}KSUD_IN_PATH"; then
+                return 0
+              fi
+
+              KSUD_TMP=/data/local/tmp/awesomecam_ksud
+              rm -f "${'$'}KSUD_TMP" 2>/dev/null || true
+              if cp /data/adb/ksud "${'$'}KSUD_TMP" 2>> "${'$'}LOG"; then
+                chmod 0755 "${'$'}KSUD_TMP" 2>/dev/null || true
+                if run_ksud_policy "${'$'}KSUD_TMP"; then
+                  return 0
+                fi
+              else
+                echo "SELINUX_RUNTIME: unable to copy /data/adb/ksud to ${'$'}KSUD_TMP"
+              fi
+
+              if run_ksud_policy /data/adb/ksud; then
+                return 0
+              fi
+
+              MAGISKPOLICY="$(command -v magiskpolicy 2>/dev/null || true)"
+              if [ -n "${'$'}MAGISKPOLICY" ]; then
+                echo "SELINUX_RUNTIME: applying policy with magiskpolicy fallback"
+                if "${'$'}MAGISKPOLICY" --live --apply "${'$'}POLICY" > "${'$'}LOG" 2>&1; then
+                  echo "SELINUX_RUNTIME: applied via ${'$'}MAGISKPOLICY"
+                  return 0
+                fi
+                echo "SELINUX_RUNTIME: magiskpolicy fallback failed"
+                tail -n 8 "${'$'}LOG" 2>/dev/null || true
+              fi
+
+              echo "ERROR: SELinux runtime policy apply failed; expected KernelSU ksud at /data/adb/ksud"
+              echo "ERROR: see ${'$'}LOG"
+              return 1
+            }
+            ensure_awesomecam_sepolicy || exit 1
+            """.trimIndent(),
+        )
+    }
+
     private fun buildFfmpegRuntimeCommands(ffmpegLibs: List<File>): List<String> {
         val ffmpegExeSrc = ffmpegLibs.firstOrNull { it.name == FFMPEG_EXE_LIB_NAME }
             ?: error("Missing local FFmpeg executable $FFMPEG_EXE_LIB_NAME")
@@ -370,7 +452,7 @@ class InjectorActivity : AppCompatActivity() {
         val hookDst = "$RUNTIME_DIR/$HOOK_ASSET"
 
         return buildList {
-            add("mkdir -p ${shellQuote(RUNTIME_DIR)}")
+            addAll(buildRuntimeSePolicyCommands())
             add("chcon u:object_r:system_data_file:s0 ${shellQuote(RUNTIME_DIR)} 2>/dev/null || true")
             add(
                 """
@@ -540,6 +622,14 @@ class InjectorActivity : AppCompatActivity() {
         }
     }
 
+    private fun runRootChecked(commands: List<String>): String {
+        val output = runRoot(commands)
+        if (!output.startsWith("exit=0\n")) {
+            error("Root command failed\n$output")
+        }
+        return output
+    }
+
     private fun shellQuote(value: String): String {
         return "'" + value.replace("'", "'\"'\"'") + "'"
     }
@@ -552,6 +642,7 @@ class InjectorActivity : AppCompatActivity() {
         private const val SHADOWHOOK_LIB_NAME = "libshadowhook.so"
         private const val FFMPEG_BIN_NAME = "ffmpeg"
         private const val FFMPEG_EXE_LIB_NAME = "libffmpegexe.so"
+        private const val RUNTIME_SEPOLICY_FILE = "/data/camera/awesomecam_runtime_sepolicy.rule"
         private const val PREFS_NAME = "video_source"
         private const val PREF_SELECTED_VIDEO_NAME = "selected_video_display_name"
         private val FFMPEG_LIB_NAMES = listOf(
@@ -563,5 +654,38 @@ class InjectorActivity : AppCompatActivity() {
             "libswscale.so",
             "libswresample.so",
         )
+        private val RUNTIME_SEPOLICY_RULES = """
+            type awesomecam_source_file { file_type mlstrustedobject }
+            type awesomecam_config_file { file_type mlstrustedobject }
+            allow su cameraserver process { ptrace getattr sigchld signal sigkill }
+            allow su system_data_root_file dir search
+            allow su system_data_file dir { search open read getattr write add_name remove_name }
+            allow su system_data_file file { create open read write getattr setattr append map unlink rename ioctl lock }
+            allow su system_lib_file file { create open read write getattr setattr append map unlink rename ioctl lock execute }
+            allow su awesomecam_source_file file { open read getattr map ioctl lock }
+            allow su awesomecam_config_file file { create open read write getattr setattr append map ioctl lock }
+            allow cameraserver system_data_root_file dir search
+            allow cameraserver system_data_file dir { search open read getattr }
+            allow cameraserver system_lib_file file { open read getattr map execute }
+            allow cameraserver cameraserver process execmem
+            allow cameraserver default_android_service service_manager add
+            allow untrusted_app default_android_service service_manager find
+            allow cameraserver untrusted_app fd use
+            allow cameraserver awesomecam_source_file file { open read getattr map ioctl lock }
+            allow cameraserver awesomecam_config_file file { create open read write getattr setattr append map }
+            allow cameraserver mediaextractor_service service_manager find
+            allow cameraserver mediaextractor binder { call transfer }
+            allow mediaextractor cameraserver binder transfer
+            allow mediaextractor cameraserver fd use
+            allow mediaextractor system_data_root_file dir search
+            allow mediaextractor system_data_file dir { search open read getattr }
+            allow mediaextractor awesomecam_source_file file { open read getattr map ioctl lock watch watch_reads }
+            allow untrusted_app system_data_root_file dir search
+            allow untrusted_app system_data_file dir { search open read getattr }
+            allow untrusted_app awesomecam_source_file file { open read getattr map ioctl lock }
+            allow su default_android_service service_manager find
+            allow su cameraserver binder { call transfer }
+            allow cameraserver su fd use
+        """.trimIndent()
     }
 }
