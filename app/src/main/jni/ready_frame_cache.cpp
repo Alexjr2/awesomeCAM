@@ -41,6 +41,12 @@ struct ReadySlot {
   std::shared_ptr<const ReadyI420Frame> frame;
 };
 
+struct ScaledI420Cache {
+  int32_t width = 0;
+  int32_t height = 0;
+  std::vector<uint8_t> bytes;
+};
+
 std::mutex g_ready_mutex;
 std::condition_variable g_ready_cv;
 std::vector<TargetKey> g_targets;
@@ -257,6 +263,87 @@ bool build_ready_frame_for_layout(int src_width, int src_height, const uint8_t *
   return true;
 }
 
+bool build_ready_frame_from_scaled_i420(const std::vector<uint8_t> &scaled_i420,
+                                        int width, int height,
+                                        ReadyFrameLayout layout,
+                                        std::vector<uint8_t> *dst_bytes,
+                                        int32_t *out_y_stride,
+                                        int32_t *out_c_stride) {
+  if (!IsSupportedReadyLayout(layout) || dst_bytes == nullptr ||
+      scaled_i420.size() < I420FrameSize(width, height)) {
+    return false;
+  }
+  if (out_y_stride != nullptr) *out_y_stride = width;
+  if (out_c_stride != nullptr) {
+    *out_c_stride = layout == kReadyFrameLayoutI420
+                        ? static_cast<int32_t>(chroma_width_for(width))
+                        : static_cast<int32_t>(chroma_width_for(width) * 2);
+  }
+  if (layout == kReadyFrameLayoutI420) {
+    *dst_bytes = scaled_i420;
+    return true;
+  }
+
+  const int cw = static_cast<int>(chroma_width_for(width));
+  const int ch = static_cast<int>(chroma_height_for(height));
+  const size_t y_size = static_cast<size_t>(width) * height;
+  const size_t c_size = static_cast<size_t>(cw) * ch;
+  const uint8_t *src_y = scaled_i420.data();
+  const uint8_t *src_u = src_y + y_size;
+  const uint8_t *src_v = src_u + c_size;
+  const int uv_stride = cw * 2;
+  dst_bytes->assign(y_size + static_cast<size_t>(uv_stride) * ch, 0);
+  uint8_t *dst_y = dst_bytes->data();
+  uint8_t *dst_uv = dst_y + y_size;
+  const bool converted =
+      layout == kReadyFrameLayoutNV21
+          ? LibYuvI420ToNV21(src_y, width, src_u, cw, src_v, cw,
+                             dst_y, width, dst_uv, uv_stride, width, height)
+          : LibYuvI420ToNV12(src_y, width, src_u, cw, src_v, cw,
+                             dst_y, width, dst_uv, uv_stride, width, height);
+  if (converted) return true;
+
+  for (int row = 0; row < height; ++row) {
+    memcpy(dst_y + static_cast<size_t>(row) * width,
+           src_y + static_cast<size_t>(row) * width, static_cast<size_t>(width));
+  }
+  for (int row = 0; row < ch; ++row) {
+    const uint8_t *u_row = src_u + static_cast<size_t>(row) * cw;
+    const uint8_t *v_row = src_v + static_cast<size_t>(row) * cw;
+    uint8_t *uv_row = dst_uv + static_cast<size_t>(row) * uv_stride;
+    for (int col = 0; col < cw; ++col) {
+      if (layout == kReadyFrameLayoutNV21) {
+        uv_row[col * 2 + 0] = v_row[col];
+        uv_row[col * 2 + 1] = u_row[col];
+      } else {
+        uv_row[col * 2 + 0] = u_row[col];
+        uv_row[col * 2 + 1] = v_row[col];
+      }
+    }
+  }
+  return true;
+}
+
+ScaledI420Cache *find_or_build_scaled_i420(std::vector<ScaledI420Cache> *cache,
+                                           int src_width, int src_height,
+                                           const uint8_t *src_i420,
+                                           size_t src_size,
+                                           int dst_width, int dst_height) {
+  if (cache == nullptr) return nullptr;
+  for (auto &entry : *cache) {
+    if (entry.width == dst_width && entry.height == dst_height) return &entry;
+  }
+  ScaledI420Cache entry{};
+  entry.width = dst_width;
+  entry.height = dst_height;
+  if (!build_ready_scaled_i420(src_width, src_height, src_i420, src_size,
+                               dst_width, dst_height, &entry.bytes)) {
+    return nullptr;
+  }
+  cache->push_back(std::move(entry));
+  return &cache->back();
+}
+
 void store_ready_frame_locked(std::shared_ptr<const ReadyI420Frame> frame) {
   if (!frame) return;
   for (auto &slot : g_slots) {
@@ -307,19 +394,24 @@ bool BuildAndStoreLatestSource(std::vector<uint8_t> *source_copy) {
   const uint64_t perf_start_ns = now_ns();
   if (source_copy == nullptr) return false;
   source_copy->assign(source.bytes, source.bytes + source.size);
+  std::vector<ScaledI420Cache> scaled_cache;
   std::vector<std::shared_ptr<const ReadyI420Frame>> built_frames;
   built_frames.reserve(targets.size());
   for (const auto &target : targets) {
+    ScaledI420Cache *scaled = find_or_build_scaled_i420(
+        &scaled_cache, source.width, source.height, source_copy->data(),
+        source_copy->size(), target.width, target.height);
+    if (scaled == nullptr) continue;
     auto frame = std::make_shared<ReadyI420Frame>();
     frame->width = target.width;
     frame->height = target.height;
     frame->layout = target.layout;
     frame->generation = source.generation;
     frame->pts_us = source.pts_us;
-    if (!build_ready_frame_for_layout(source.width, source.height, source_copy->data(),
-                                      source_copy->size(), target.width, target.height,
-                                      target.layout, &frame->bytes, &frame->y_stride,
-                                      &frame->c_stride)) {
+    if (!build_ready_frame_from_scaled_i420(scaled->bytes, target.width,
+                                            target.height, target.layout,
+                                            &frame->bytes, &frame->y_stride,
+                                            &frame->c_stride)) {
       continue;
     }
     built_frames.push_back(std::move(frame));

@@ -160,6 +160,18 @@ enum class DecodeOutcome {
 
 void SignalHandler(int) { g_stop.store(true, std::memory_order_release); }
 
+void TuneCurrentThreadPriority(const char *where) {
+  const pid_t tid = static_cast<pid_t>(syscall(SYS_gettid));
+  const int rc = setpriority(PRIO_PROCESS, tid, -4);
+  if (rc == 0) {
+    LOGI("MediaCodecPlayer: priority tuned tid=%d nice=-4 where=%s",
+         tid, where != nullptr ? where : "main");
+  } else if (access("/data/camera/awesomecam_verbose", F_OK) == 0) {
+    LOGW("MediaCodecPlayer: priority tune failed tid=%d errno=%d where=%s",
+         tid, errno, where != nullptr ? where : "main");
+  }
+}
+
 void *ClientOnCreate(void *) { return nullptr; }
 void ClientOnDestroy(void *) {}
 binder_status_t ClientOnTransact(AIBinder *, transaction_code_t, const AParcel *, AParcel *) {
@@ -684,6 +696,11 @@ void PaceFrame(int64_t pts_us, bool *clock_started, int64_t *base_wall_us,
   }
   const int64_t target_us = *base_wall_us + std::max<int64_t>(0, pts_us - *base_pts_us);
   const int64_t sleep_us = target_us - now_us;
+  if (sleep_us < -250000) {
+    *base_wall_us = now_us;
+    *base_pts_us = pts_us;
+    return;
+  }
   if (sleep_us > 1000 && !g_stop.load(std::memory_order_acquire)) {
     std::this_thread::sleep_for(std::chrono::microseconds(sleep_us));
   }
@@ -692,17 +709,14 @@ void PaceFrame(int64_t pts_us, bool *clock_started, int64_t *base_wall_us,
 bool ShouldDropForFpsCap(const Options &opt, int64_t pts_us, bool clock_started,
                          int64_t base_wall_us, int64_t base_pts_us,
                          int64_t last_published_pts_us) {
+  (void)clock_started;
+  (void)base_wall_us;
+  (void)base_pts_us;
   if (opt.fps_cap <= 0 || pts_us < 0) return false;
   const int64_t min_delta_us = std::max<int64_t>(1, 1000000LL / opt.fps_cap);
   if (last_published_pts_us >= 0 &&
       pts_us - last_published_pts_us < (min_delta_us * 9) / 10) {
     return true;
-  }
-  if (clock_started) {
-    const int64_t target_wall_us =
-        base_wall_us + std::max<int64_t>(0, pts_us - base_pts_us);
-    const int64_t late_us = MonotonicUs() - target_wall_us;
-    if (late_us > min_delta_us * 2) return true;
   }
   return false;
 }
@@ -1405,6 +1419,7 @@ DecodeOutcome DecodeOnce(const Options &opt, BinderClient *binder,
 int main(int argc, char **argv) {
   signal(SIGTERM, SignalHandler);
   signal(SIGINT, SignalHandler);
+  TuneCurrentThreadPriority("main");
 
   Options opt = ParseOptions(argc, argv);
   WritePidFile(opt.pidfile);
