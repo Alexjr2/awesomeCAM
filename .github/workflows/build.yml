@@ -1,0 +1,65 @@
+name: Build CI (Release)
+
+on:
+  workflow_dispatch:
+    inputs:
+      TAG:
+        description: Release Tag
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    env:
+      ANDROID_NDK_VERSION: 25.1.8937393
+      ANDROID_CMAKE_VERSION: 3.22.1
+
+    steps:
+      - uses: actions/checkout@main
+
+      - uses: actions/setup-java@main
+        with:
+          distribution: temurin
+          java-version: 17
+          cache: gradle
+
+      - uses: android-actions/setup-android@main
+
+      - name: Install Android SDK (Pinned)
+        run: |
+          sdkmanager --licenses
+
+          sdkmanager \
+            "platforms;android-34" \
+            "ndk;${ANDROID_NDK_VERSION}" \
+            "cmake;${ANDROID_CMAKE_VERSION}"
+
+      - uses: gradle/actions/setup-gradle@main
+
+      - name: Grant Gradle permission
+        run: chmod +x gradlew
+
+      - name: Build Release
+        run: |
+          ./gradlew assembleRelease \
+            --stacktrace \
+            --no-daemon \
+            --configuration-cache
+
+      - name: Upload APK Artifact
+        uses: actions/upload-artifact@main
+        with:
+          name: release-apk
+          path: app/build/outputs/apk/release/*.apk
+
+      - name: Create GitHub Release
+        uses: ncipollo/release-action@main
+        with:
+          tag: ${{ github.event.inputs.TAG }}
+          name: AwesomeCAM
+          allowUpdates: true
+          artifacts: app/build/outputs/apk/release/*.apk
