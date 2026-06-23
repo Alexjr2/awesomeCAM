@@ -47,8 +47,7 @@ jobs:
         run: |
           ./gradlew assembleRelease \
             --stacktrace \
-            --no-daemon \
-            --configuration-cache
+            --no-daemon
 
       - name: Upload APK Artifact
         uses: actions/upload-artifact@main
