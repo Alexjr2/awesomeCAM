@@ -1,0 +1,53 @@
+name: Build CI (Release)
+
+on:
+  workflow_dispatch:
+    inputs:
+      TAG:
+        description: Release Tag
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@main
+
+      - uses: actions/setup-java@main
+        with:
+          distribution: temurin
+          java-version: 17
+          cache: gradle
+
+      - uses: android-actions/setup-android@main
+
+      - name: Install Android SDK Packages
+        run: |
+          sdkmanager \
+            "platforms;android-34" \
+            "build-tools;36.1.0" \
+            "cmake;3.22.1" \
+            "ndk;26.3.11579264"
+
+      - uses: gradle/actions/setup-gradle@main
+
+      - run: chmod +x gradlew
+
+      - name: Build Release
+        run: ./gradlew assembleRelease --stacktrace --no-daemon
+
+      - uses: actions/upload-artifact@main
+        with:
+          name: release-apk
+          path: app/build/outputs/apk/release/*.apk
+
+      - uses: ncipollo/release-action@main
+        with:
+          tag: ${{ github.event.inputs.TAG }}
+          name: AwesomeCAM
+          allowUpdates: true
+          artifacts: app/build/outputs/apk/release/*.apk
